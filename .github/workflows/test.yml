@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Daily at 13:00 UTC — catches breakage from runner/tool updates.
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install lint deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck shfmt zsh
+          npm install --global markdownlint-cli2
+
+      - name: Check shell formatting
+        run: |
+          shfmt -d -i 2 install.sh cs.zsh tests/smoke.zsh claude-switch.plugin.zsh
+
+      - name: Run shellcheck
+        run: |
+          shellcheck -x install.sh cs.zsh claude-switch.plugin.zsh
+
+      - name: Lint Markdown
+        run: |
+          markdownlint-cli2 '**/*.md' '#node_modules'
+
+      - name: Check typos
+        uses: crate-ci/typos@master
+        with:
+          files: .
+
+      - name: Check zsh syntax
+        run: |
+          zsh -n claude-switch.plugin.zsh cs.zsh tests/smoke.zsh
+
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install jq || true   # macOS images already ship jq
+
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh jq xclip
+
+      - name: Run smoke tests
+        run: ./tests/smoke.zsh

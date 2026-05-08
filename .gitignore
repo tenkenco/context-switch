@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Just in case anyone copies real profile material into the repo
+*.token
+*.account.json
+accounts/
