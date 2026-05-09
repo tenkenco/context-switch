@@ -67,7 +67,16 @@ _cs_validate_name() {
 
 # Numeric file mode (e.g., "600"). BSD stat on macOS, GNU stat on Linux.
 _cs_stat_mode() {
-  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+  local m
+  m="$(stat -c '%a' "$1" 2>/dev/null)" && [[ -n "$m" ]] && {
+    print -- "$m"
+    return 0
+  }
+  m="$(stat -f '%Lp' "$1" 2>/dev/null)" && [[ -n "$m" ]] && {
+    print -- "$m"
+    return 0
+  }
+  return 1
 }
 
 _cs_have_clipboard() { [[ -n "$_CS_PASTE_CMD" ]]; }

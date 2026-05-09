@@ -11,7 +11,7 @@ set -u
 emulate -L zsh
 setopt extended_glob
 
-REPO_DIR="${0:A:h:h}"
+REPO_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd -P)"
 CS_ZSH="$REPO_DIR/cs.zsh"
 [[ -f "$CS_ZSH" ]] || {
   echo "FATAL: cannot find $CS_ZSH" >&2
@@ -77,7 +77,7 @@ assert_file_absent() {
 assert_file_mode() {
   local desc="$1" file="$2" expected="$3"
   local actual
-  actual="$(stat -f '%Lp' "$file" 2>/dev/null)"
+  actual="$(_cs_stat_mode "$file" 2>/dev/null)"
   if [[ "$actual" == "$expected" ]]; then
     _pass "$desc"
   else
