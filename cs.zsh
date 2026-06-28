@@ -304,6 +304,83 @@ _cs_list() {
   ((found)) || echo "(no profiles — run: cs save <name>)"
 }
 
+# Validate a single token against the Anthropic API, bypassing the keychain.
+# This is the only reliable expiry check: newer Claude Code silently falls back
+# to the keychain on a 401 ("OAuth 401 recovery"), so launching `claude` can
+# appear to "work" even when the pinned token is dead. A direct API call sees
+# the raw 200/401 with no fallback. Echoes a status word; returns 0 if usable.
+_cs_check_token() {
+  local tok="$1" code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+    https://api.anthropic.com/v1/messages \
+    -H "authorization: Bearer $tok" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' 2>/dev/null)"
+  case "$code" in
+  200)
+    print -- "OK"
+    return 0
+    ;;
+  401 | 403)
+    print -- "EXPIRED ($code)"
+    return 1
+    ;;
+  000 | "")
+    print -- "UNREACHABLE (no network/curl)"
+    return 2
+    ;;
+  429)
+    print -- "OK but RATE-LIMITED (429)"
+    return 0
+    ;;
+  *)
+    print -- "UNKNOWN (HTTP $code)"
+    return 2
+    ;;
+  esac
+}
+
+# Validate every saved profile's token against the API. Surfaces the silent
+# keychain-fallback masking: tells you which profiles need `cs save --force`.
+_cs_doctor() {
+  local dir="$HOME/.claude/accounts"
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "cs: doctor needs curl to validate tokens." >&2
+    return 1
+  fi
+  setopt local_options null_glob
+  local found=0 f name email tstat rc bad=0 tok marker
+  for f in "$dir"/*.token; do
+    found=1
+    name="${f:t:r}"
+    marker="  "
+    [[ "$name" == "$_CS_PROFILE" ]] && marker="* "
+    email="?"
+    [[ -f "$dir/$name.account.json" ]] &&
+      email="$(jq -r '.emailAddress // "?"' "$dir/$name.account.json" 2>/dev/null)"
+    tok="$(cat "$f" 2>/dev/null)"
+    tstat="$(_cs_check_token "$tok")"
+    rc=$?
+    ((rc == 1)) && bad=1
+    echo "${marker}${name} — ${email}: ${tstat}"
+  done
+  ((found)) || {
+    echo "(no profiles — run: cs save <name>)"
+    return 0
+  }
+  if ((bad)); then
+    echo "" >&2
+    echo "cs: one or more tokens are expired. Re-mint with:" >&2
+    echo "    claude setup-token | cs save <name> --force" >&2
+    echo "Note: an expired token does NOT error at launch — Claude Code silently" >&2
+    echo "falls back to your keychain account, so the wrong account runs quietly." >&2
+    return 1
+  fi
+  return 0
+}
+
 _cs_current() {
   if [[ -n "$_CS_PROFILE" ]]; then
     echo "$_CS_PROFILE"
@@ -356,6 +433,7 @@ Usage:
   cs use <name>              Export CLAUDE_CODE_OAUTH_TOKEN for THIS shell only.
   cs off                     Unset the env var; subsequent `claude` uses keychain default.
   cs list                    List profiles; * marks the one pinned in this shell.
+  cs doctor                  Validate each saved token against the API (OK / EXPIRED).
   cs current                 Print the pin for this shell.
   cs rm <name>               Delete a saved profile.
 
@@ -384,7 +462,9 @@ Caveats:
     use the keychain. CLI-only feature.
   - Two terminals launching `claude` at the literal same instant could race
     on the ~/.claude.json patch (cosmetic display only, not auth).
-  - Re-run `cs save <name> --force` if a token eventually expires.
+  - Re-run `cs save <name> --force` if a token eventually expires. Newer Claude
+    Code silently falls back to your keychain account on an expired token (no
+    error), so the wrong account can run quietly. Run `cs doctor` to catch it.
 EOF
 }
 
@@ -400,6 +480,7 @@ cs() {
   use) _cs_use "$@" ;;
   off) _cs_off "$@" ;;
   list | ls) _cs_list "$@" ;;
+  doctor | check) _cs_doctor "$@" ;;
   current) _cs_current "$@" ;;
   rm) _cs_rm "$@" ;;
   help | -h | --help | "") _cs_help ;;

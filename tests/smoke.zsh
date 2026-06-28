@@ -136,7 +136,8 @@ SH
   unset CLAUDE_CODE_OAUTH_TOKEN _CS_PROFILE _CS_TOKEN_SOURCE TEST_CLIPBOARD 2>/dev/null
   unfunction cs claude _cs_validate_name _cs_stat_mode _cs_paste _cs_copy \
     _cs_have_clipboard _cs_oauth_account_json _cs_read_token \
-    _cs_save _cs_use _cs_off _cs_list _cs_current _cs_rm _cs_help 2>/dev/null
+    _cs_save _cs_use _cs_off _cs_list _cs_check_token _cs_doctor \
+    _cs_current _cs_rm _cs_help 2>/dev/null
   source "$CS_ZSH"
   # Override platform detection: cs.zsh probed PATH at source-time. With our
   # stubs first on PATH, it should have picked pbpaste/pbcopy — but reseat
@@ -513,6 +514,56 @@ t_list() {
   teardown
 }
 
+# Install a fake curl that emulates the API's HTTP status line. It inspects its
+# args for the bearer token and prints a code: tokens containing "EXPIRED" ->
+# 401, "DOWN" -> 000 (unreachable), otherwise 200. Matches the real curl's
+# `-w '%{http_code}'` contract (code on stdout, body discarded via -o).
+stub_curl() {
+  cat >"$SANDBOX/bin/curl" <<'SH'
+#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    *EXPIRED*) printf '401'; exit 0 ;;
+    *DOWN*)    printf '000'; exit 0 ;;
+  esac
+done
+printf '200'
+SH
+  chmod +x "$SANDBOX/bin/curl"
+}
+
+t_doctor() {
+  echo "[doctor: validates tokens against API]"
+  setup
+  stub_curl
+  local out
+  out="$(cs doctor 2>&1)"
+  assert_contains "doctor with no profiles" "$out" "no profiles"
+
+  seed_profile personal
+  seed_profile work sk-ant-oat01-EXPIRED-TOKEN
+  seed_profile dead sk-ant-oat01-DOWN-TOKEN
+
+  out="$(cs doctor 2>&1)"
+  assert_contains "healthy token reported OK" "$out" "personal@example.com: OK"
+  assert_contains "expired token reported EXPIRED" "$out" "work@example.com: EXPIRED (401)"
+  assert_contains "unreachable token reported" "$out" "dead@example.com: UNREACHABLE"
+  assert_contains "expired triggers re-mint hint" "$out" "cs save <name> --force"
+
+  # Non-zero exit when any token is expired (for scripting).
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor returns 1 when a token is expired" "$?" "1"
+
+  # All-healthy run exits 0 and pins the * marker on the active profile.
+  rm -f "$HOME/.claude/accounts/work."* "$HOME/.claude/accounts/dead."*
+  cs use personal >/dev/null 2>&1
+  out="$(cs doctor 2>&1)"
+  assert_contains "active profile gets * marker" "$out" "* personal"
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor returns 0 when all healthy" "$?" "0"
+  teardown
+}
+
 t_current() {
   echo "[current]"
   setup
@@ -683,6 +734,7 @@ t_use_missing_files
 t_use_happy_path
 t_off_unsets
 t_list
+t_doctor
 t_current
 t_resource_preserves_profile
 t_rm_invalid_name
