@@ -319,11 +319,26 @@ _cs_check_token() {
     -H "content-type: application/json" \
     -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' 2>/dev/null)"
   case "$code" in
-  200) print -- "OK"; return 0 ;;
-  401 | 403) print -- "EXPIRED ($code)"; return 1 ;;
-  000 | "") print -- "UNREACHABLE (no network/curl)"; return 2 ;;
-  429) print -- "OK but RATE-LIMITED (429)"; return 0 ;;
-  *) print -- "UNKNOWN (HTTP $code)"; return 2 ;;
+  200)
+    print -- "OK"
+    return 0
+    ;;
+  401 | 403)
+    print -- "EXPIRED ($code)"
+    return 1
+    ;;
+  000 | "")
+    print -- "UNREACHABLE (no network/curl)"
+    return 2
+    ;;
+  429)
+    print -- "OK but RATE-LIMITED (429)"
+    return 0
+    ;;
+  *)
+    print -- "UNKNOWN (HTTP $code)"
+    return 2
+    ;;
   esac
 }
 
@@ -351,7 +366,10 @@ _cs_doctor() {
     ((rc == 1)) && bad=1
     echo "${marker}${name} — ${email}: ${tstat}"
   done
-  ((found)) || { echo "(no profiles — run: cs save <name>)"; return 0; }
+  ((found)) || {
+    echo "(no profiles — run: cs save <name>)"
+    return 0
+  }
   if ((bad)); then
     echo "" >&2
     echo "cs: one or more tokens are expired. Re-mint with:" >&2
