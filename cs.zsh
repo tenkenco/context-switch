@@ -184,7 +184,7 @@ _cs_save() {
     shift
   done
   [[ -z "$name" ]] && {
-    echo "cs save <name> [--force] [--token <tok> | --clipboard | --stdin]" >&2
+    echo "cs save <name> [--force] [--allow-mismatch] [--token <tok> | --clipboard | --stdin]" >&2
     return 1
   }
   _cs_validate_name "$name" || {
@@ -212,9 +212,9 @@ _cs_save() {
     echo "cs: $user_cfg has no .oauthAccount — log into Claude Code first" >&2
     return 1
   }
-  local cur_email cur_tier
-  cur_email="$(echo "$acct" | jq -r '.emailAddress // "?"')"
-  cur_tier="$(echo "$acct" | jq -r '.organizationRateLimitTier // "?"')"
+  local cur_email cur_tier snap_org
+  IFS=$'\t' read -r cur_email cur_tier snap_org <<<"$(printf '%s' "$acct" |
+    jq -r '[.emailAddress // "?", .organizationRateLimitTier // "?", .organizationUuid // ""] | @tsv')"
 
   _cs_read_token "$explicit_token" "$use_clipboard" "$use_stdin" "$cur_email" "$cur_tier" "$name" || return 1
   local token
@@ -236,8 +236,6 @@ _cs_save() {
   # belongs to the BROWSER session that approved the OAuth URL, while the
   # snapshot comes from the CLI's login, and nothing else ever cross-checks
   # the two. Compare the token's real org (response header) to the snapshot's.
-  local snap_org
-  snap_org="$(echo "$acct" | jq -r '.organizationUuid // empty')"
   if command -v curl >/dev/null 2>&1; then
     _cs_check_token "$token"
     case $? in
@@ -251,7 +249,18 @@ _cs_save() {
       echo "    Run 'cs doctor' once you're back online." >&2
       ;;
     0)
-      if [[ -n "$snap_org" && -n "$_CS_CHECK_ORG" && "$_CS_CHECK_ORG" != "$snap_org" ]]; then
+      if [[ -z "$snap_org" || -z "$_CS_CHECK_ORG" ]]; then
+        if ((allow_mismatch)); then
+          echo "cs: warning — could not verify token/account identity; saving anyway (--allow-mismatch)." >&2
+          echo "    Token status: ${_CS_CHECK_STATUS}; snapshot org: ${snap_org:-unknown}; token org: ${_CS_CHECK_ORG:-unknown}." >&2
+        else
+          echo "cs: could not verify token/account identity — refusing to save '$name'." >&2
+          echo "    Token status: ${_CS_CHECK_STATUS}; snapshot org: ${snap_org:-unknown}; token org: ${_CS_CHECK_ORG:-unknown}." >&2
+          echo "    Re-run after the API returns an organization id, or add --allow-mismatch" >&2
+          echo "    to save anyway (auth may be correct; /status may display the wrong identity)." >&2
+          return 1
+        fi
+      elif [[ "$_CS_CHECK_ORG" != "$snap_org" ]]; then
         if ((allow_mismatch)); then
           echo "cs: warning — token account differs from the CLI login being snapshotted" >&2
           echo "    ($cur_email). Saving anyway (--allow-mismatch): auth will use the" >&2
@@ -315,17 +324,19 @@ _cs_use() {
   }
 
   local token
-  token="$(cat "$tok_file")"
+  token="$(<"$tok_file")"
   export CLAUDE_CODE_OAUTH_TOKEN="$token"
-  _CS_PROFILE="$name"
+  export _CS_PROFILE="$name"
   local email
   email="$(jq -r '.emailAddress // "?"' "$acct_file" 2>/dev/null)"
   echo "cs: this shell pinned to '$name' ($email). Run 'claude' to launch."
 }
 
 _cs_off() {
+  local was_pinned=0
+  [[ -n "${_CS_PROFILE:-}" || -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && was_pinned=1
   unset CLAUDE_CODE_OAUTH_TOKEN _CS_PROFILE
-  _cs_restore_keychain_account
+  ((was_pinned)) && _cs_restore_keychain_account
   echo "cs: this shell unpinned (env-var cleared)."
 }
 
@@ -366,15 +377,21 @@ _cs_list() {
 #                      URL, which need not match the CLI's login.
 # Returns 0 if usable, 1 if expired/invalid, 2 if indeterminate.
 _cs_check_token() {
-  local tok="$1" code hdrs
+  local tok="$1" code hdrs cfg_tok
   _CS_CHECK_STATUS=""
   _CS_CHECK_ORG=""
-  hdrs="$(mktemp)"
+  hdrs="$(mktemp)" || {
+    _CS_CHECK_STATUS="UNREACHABLE (could not create temp file)"
+    return 2
+  }
+  cfg_tok="${tok//\\/\\\\}"
+  cfg_tok="${cfg_tok//\"/\\\"}"
   # The authorization header goes in via a stdin config (-K -), not argv:
   # on Linux /proc/<pid>/cmdline is world-readable, so a token in curl's
   # arguments would be visible to every local user for the whole request.
-  # printf is a zsh builtin, so no process ever holds the token in argv.
-  code="$(printf 'header = "authorization: Bearer %s"\n' "$tok" |
+  # printf is a zsh builtin, so no process ever holds the token in argv. Escape
+  # curl-config metacharacters so a malformed paste cannot skip verification.
+  code="$(printf 'header = "authorization: Bearer %s"\n' "$cfg_tok" |
     curl -sS -o /dev/null -D "$hdrs" -w '%{http_code}' --max-time 20 -K - \
       https://api.anthropic.com/v1/messages \
       -H "anthropic-beta: oauth-2025-04-20" \
@@ -389,9 +406,13 @@ _cs_check_token() {
     _CS_CHECK_STATUS="OK"
     return 0
     ;;
-  401 | 403)
+  401)
     _CS_CHECK_STATUS="EXPIRED ($code)"
     return 1
+    ;;
+  403)
+    _CS_CHECK_STATUS="FORBIDDEN (403)"
+    return 2
     ;;
   000 | "")
     _CS_CHECK_STATUS="UNREACHABLE (no network/curl)"
@@ -417,7 +438,7 @@ _cs_doctor() {
     return 1
   fi
   setopt local_options null_glob
-  local found=0 f name email snap_org rc bad=0 mismatch=0 tok marker note
+  local found=0 f name email snap_org rc bad=0 mismatch=0 unverified=0 identity_unknown=0 tok marker note
   for f in "$dir"/*.token; do
     found=1
     name="${f:t:r}"
@@ -426,17 +447,26 @@ _cs_doctor() {
     email="?"
     snap_org=""
     if [[ -f "$dir/$name.account.json" ]]; then
-      email="$(jq -r '.emailAddress // "?"' "$dir/$name.account.json" 2>/dev/null)"
-      snap_org="$(jq -r '.organizationUuid // empty' "$dir/$name.account.json" 2>/dev/null)"
+      IFS=$'\t' read -r email snap_org <<<"$(
+        jq -r '[.emailAddress // "?", .organizationUuid // ""] | @tsv' "$dir/$name.account.json" 2>/dev/null
+      )"
     fi
-    tok="$(cat "$f" 2>/dev/null)"
+    tok="$(<"$f")"
     _cs_check_token "$tok"
     rc=$?
     ((rc == 1)) && bad=1
+    ((rc == 2)) && unverified=1
     note=""
-    if ((rc == 0)) && [[ -n "$snap_org" && -n "$_CS_CHECK_ORG" && "$snap_org" != "$_CS_CHECK_ORG" ]]; then
-      mismatch=1
-      note=" — ORG MISMATCH (token belongs to a different account than the snapshot)"
+    if ((rc == 2)); then
+      note=" — NOT VERIFIED"
+    elif ((rc == 0)); then
+      if [[ -z "$snap_org" || -z "$_CS_CHECK_ORG" ]]; then
+        identity_unknown=1
+        note=" — IDENTITY UNKNOWN (missing snapshot org or token org)"
+      elif [[ "$snap_org" != "$_CS_CHECK_ORG" ]]; then
+        mismatch=1
+        note=" — ORG MISMATCH (token belongs to a different account than the snapshot)"
+      fi
     fi
     echo "${marker}${name} — ${email}: ${_CS_CHECK_STATUS}${note}"
   done
@@ -458,6 +488,20 @@ _cs_doctor() {
     echo "as a different account than the saved snapshot, so /status will display the" >&2
     echo "wrong email. Fix: /login the CLI as the token's account, then re-run:" >&2
     echo "    claude setup-token | cs save <name> --force" >&2
+    return 1
+  fi
+  if ((identity_unknown)); then
+    echo "" >&2
+    echo "cs: one or more profiles could not be identity-checked because either" >&2
+    echo "the saved snapshot or the token response lacked an organization id." >&2
+    echo "Re-save after logging the CLI into the intended account:" >&2
+    echo "    claude setup-token | cs save <name> --force" >&2
+    return 1
+  fi
+  if ((unverified)); then
+    echo "" >&2
+    echo "cs: one or more tokens could not be verified. Re-run once network/API" >&2
+    echo "checks are available; until then, expired-token fallback may be masked." >&2
     return 1
   fi
   return 0
@@ -617,9 +661,22 @@ _cs_profile_email() {
   [[ -n "$email" ]] && echo "$email" || echo "?"
 }
 
+_cs_write_oauth_account() {
+  local src="$1" cfg="$2" tmp mode
+  tmp="$(mktemp)" || return 1
+  if jq --slurpfile a "$src" '.oauthAccount = $a[0]' "$cfg" >"$tmp" 2>/dev/null; then
+    mode="$(_cs_stat_mode "$cfg")"
+    [[ -n "$mode" ]] && chmod "$mode" "$tmp"
+    mv "$tmp" "$cfg"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 _cs_patch_oauth_account_for_profile() {
   local profile="$1"
-  local af cfg tmp mode
+  local af cfg
   af="$(_cs_profile_account_file "$profile")"
   cfg="$HOME/.claude.json"
 
@@ -645,18 +702,13 @@ _cs_patch_oauth_account_for_profile() {
     )
   fi
 
-  tmp="$(mktemp)"
-  if jq --slurpfile a "$af" '.oauthAccount = $a[0]' "$cfg" >"$tmp"; then
-    mode="$(_cs_stat_mode "$cfg")"
-    [[ -n "$mode" ]] && chmod "$mode" "$tmp"
-    mv "$tmp" "$cfg"
+  if _cs_write_oauth_account "$af" "$cfg"; then
     (
       umask 077
-      jq -c '.oauthAccount // empty' "$cfg" 2>/dev/null >"$(_cs_last_patch_file)"
+      jq -c . "$af" 2>/dev/null >"$(_cs_last_patch_file)"
     )
     return 0
   fi
-  rm -f "$tmp"
   echo "cs: warning — failed to patch ~/.claude.json oauthAccount (auth still uses env var)" >&2
   return 0
 }
@@ -667,7 +719,7 @@ _cs_patch_oauth_account_for_profile() {
 # stashed keychain identity. If the user has /login'd since (oauthAccount no
 # longer matches our last patch), leave everything alone.
 _cs_restore_keychain_account() {
-  local cfg="$HOME/.claude.json" stash last cur tmp mode
+  local cfg="$HOME/.claude.json" stash last cur
   stash="$(_cs_keychain_stash_file)"
   [[ -f "$stash" && -f "$cfg" && ! -L "$cfg" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
@@ -675,14 +727,8 @@ _cs_restore_keychain_account() {
   [[ -n "$last" ]] || return 0
   cur="$(jq -c '.oauthAccount // empty' "$cfg" 2>/dev/null)"
   [[ "$cur" == "$last" ]] || return 0
-  tmp="$(mktemp)"
-  if jq --slurpfile a "$stash" '.oauthAccount = $a[0]' "$cfg" >"$tmp" 2>/dev/null; then
-    mode="$(_cs_stat_mode "$cfg")"
-    [[ -n "$mode" ]] && chmod "$mode" "$tmp"
-    mv "$tmp" "$cfg"
+  if _cs_write_oauth_account "$stash" "$cfg"; then
     rm -f "$(_cs_last_patch_file)"
-  else
-    rm -f "$tmp"
   fi
   return 0
 }
