@@ -172,11 +172,13 @@ JSON
   chmod 600 "$HOME/.claude/accounts/$name.token" "$HOME/.claude/accounts/$name.account.json"
 }
 
-# Install a fake curl that emulates the API. Inspects its args for the bearer
-# token: tokens containing "EXPIRED" -> 401, "DOWN" -> 000 (unreachable),
-# otherwise 200. Tokens containing "OTHERORG" report organization id
-# "org-elsewhere", everything else "org-home". Honors the real invocation's
-# contract: `-w '%{http_code}'` code on stdout, `-D <file>` response headers.
+# Install a fake curl that emulates the API. The bearer token arrives via the
+# stdin config (`-K -`, keeping it out of argv like the real invocation), so
+# the stub inspects argv AND the stdin config for markers: tokens containing
+# "EXPIRED" -> 401, "DOWN" -> 000 (unreachable), otherwise 200. Tokens
+# containing "OTHERORG" report organization id "org-elsewhere", everything
+# else "org-home". Honors the real invocation's contract: `-w '%{http_code}'`
+# code on stdout, `-D <file>` response headers.
 stub_curl() {
   cat >"$SANDBOX/bin/curl" <<'SH'
 #!/bin/sh
@@ -184,15 +186,26 @@ hdr=""
 prev=""
 code="200"
 org="org-home"
+stdin_cfg=0
 for a in "$@"; do
   [ "$prev" = "-D" ] && hdr="$a"
+  [ "$prev" = "-K" ] && [ "$a" = "-" ] && stdin_cfg=1
+  # Regression guard: the token must NEVER appear in argv (world-readable via
+  # /proc/<pid>/cmdline on Linux). Fail hard so every token test breaks.
   case "$a" in
-    *EXPIRED*)  code="401" ;;
-    *DOWN*)     code="000" ;;
-    *OTHERORG*) org="org-elsewhere" ;;
+    *sk-ant-oat*) printf '999'; exit 0 ;;
   esac
   prev="$a"
 done
+haystack="$*"
+[ "$stdin_cfg" = "1" ] && haystack="$haystack $(cat)"
+case "$haystack" in
+  *EXPIRED*) code="401" ;;
+  *DOWN*)    code="000" ;;
+esac
+case "$haystack" in
+  *OTHERORG*) org="org-elsewhere" ;;
+esac
 if [ -n "$hdr" ] && [ "$code" != "000" ]; then
   printf 'HTTP/2 %s\r\nanthropic-organization-id: %s\r\n\r\n' "$code" "$org" >"$hdr"
 fi

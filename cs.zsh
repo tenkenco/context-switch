@@ -370,13 +370,17 @@ _cs_check_token() {
   _CS_CHECK_STATUS=""
   _CS_CHECK_ORG=""
   hdrs="$(mktemp)"
-  code="$(curl -sS -o /dev/null -D "$hdrs" -w '%{http_code}' --max-time 20 \
-    https://api.anthropic.com/v1/messages \
-    -H "authorization: Bearer $tok" \
-    -H "anthropic-beta: oauth-2025-04-20" \
-    -H "anthropic-version: 2023-06-01" \
-    -H "content-type: application/json" \
-    -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' 2>/dev/null)"
+  # The authorization header goes in via a stdin config (-K -), not argv:
+  # on Linux /proc/<pid>/cmdline is world-readable, so a token in curl's
+  # arguments would be visible to every local user for the whole request.
+  # printf is a zsh builtin, so no process ever holds the token in argv.
+  code="$(printf 'header = "authorization: Bearer %s"\n' "$tok" |
+    curl -sS -o /dev/null -D "$hdrs" -w '%{http_code}' --max-time 20 -K - \
+      https://api.anthropic.com/v1/messages \
+      -H "anthropic-beta: oauth-2025-04-20" \
+      -H "anthropic-version: 2023-06-01" \
+      -H "content-type: application/json" \
+      -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' 2>/dev/null)"
   _CS_CHECK_ORG="$(tr -d '\r' <"$hdrs" 2>/dev/null |
     awk -F': ' 'tolower($1)=="anthropic-organization-id"{print $2; exit}')"
   rm -f "$hdrs"
