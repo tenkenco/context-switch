@@ -110,6 +110,7 @@ setup() {
   "oauthAccount": {
     "emailAddress": "before@example.com",
     "organizationRateLimitTier": "default_test_tier",
+    "organizationUuid": "org-home",
     "accountUuid": "00000000-0000-0000-0000-000000000000"
   },
   "unrelatedKey": "must_be_preserved"
@@ -132,12 +133,17 @@ cat > "$SANDBOX/.pbcopy.last"
 SH
   chmod +x "$SANDBOX/bin/"*
   export PATH="$SANDBOX/bin:$PATH"
+  # cs save now verifies tokens over the network, so every test needs the
+  # fake curl, not just doctor's.
+  stub_curl
   # Reset shell state and source under test
   unset CLAUDE_CODE_OAUTH_TOKEN _CS_PROFILE _CS_TOKEN_SOURCE TEST_CLIPBOARD 2>/dev/null
   unfunction cs claude _cs_validate_name _cs_stat_mode _cs_paste _cs_copy \
     _cs_have_clipboard _cs_oauth_account_json _cs_read_token \
     _cs_save _cs_use _cs_off _cs_list _cs_check_token _cs_doctor \
-    _cs_current _cs_rm _cs_help 2>/dev/null
+    _cs_current _cs_rm _cs_help _cs_profile_account_file _cs_profile_email \
+    _cs_keychain_stash_file _cs_last_patch_file _cs_write_oauth_account \
+    _cs_patch_oauth_account_for_profile _cs_restore_keychain_account 2>/dev/null
   source "$CS_ZSH"
   # Override platform detection: cs.zsh probed PATH at source-time. With our
   # stubs first on PATH, it should have picked pbpaste/pbcopy — but reseat
@@ -154,14 +160,66 @@ teardown() {
 }
 
 # Helper: write a fully-formed profile (token + account snapshot) bypassing cs save.
+# Snapshot org defaults to org-home, matching what the stub curl reports for
+# ordinary tokens, so seeded profiles are identity-consistent by default.
 seed_profile() {
-  local name="$1" token="${2:-sk-ant-oat01-FAKE-TOKEN-FOR-TESTS}"
+  local name="$1" token="${2:-sk-ant-oat01-FAKE-TOKEN-FOR-TESTS}" org="org-home"
+  (($# >= 3)) && org="$3"
   mkdir -p "$HOME/.claude/accounts"
   printf '%s' "$token" >"$HOME/.claude/accounts/$name.token"
   cat >"$HOME/.claude/accounts/$name.account.json" <<JSON
-{"emailAddress":"$name@example.com","organizationRateLimitTier":"tier_$name","accountUuid":"uuid-$name"}
+{"emailAddress":"$name@example.com","organizationRateLimitTier":"tier_$name","organizationUuid":"$org","accountUuid":"uuid-$name"}
 JSON
   chmod 600 "$HOME/.claude/accounts/$name.token" "$HOME/.claude/accounts/$name.account.json"
+}
+
+# Install a fake curl that emulates the API. The bearer token arrives via the
+# stdin config (`-K -`, keeping it out of argv like the real invocation), so
+# the stub inspects argv AND the stdin config for markers: tokens containing
+# "EXPIRED" -> 401, "FORBIDDEN" -> 403, "DOWN" -> 000 (unreachable), otherwise
+# 200. Tokens containing "OTHERORG" report organization id "org-elsewhere";
+# tokens containing "NOORG" omit the org header; everything else reports
+# "org-home". Honors the real invocation's contract: `-w '%{http_code}'` code
+# on stdout, `-D <file>` response headers.
+stub_curl() {
+  cat >"$SANDBOX/bin/curl" <<'SH'
+#!/bin/sh
+hdr=""
+prev=""
+code="200"
+org="org-home"
+stdin_cfg=0
+for a in "$@"; do
+  [ "$prev" = "-D" ] && hdr="$a"
+  [ "$prev" = "-K" ] && [ "$a" = "-" ] && stdin_cfg=1
+  # Regression guard: the token must NEVER appear in argv (world-readable via
+  # /proc/<pid>/cmdline on Linux). Fail hard so every token test breaks.
+  case "$a" in
+    *sk-ant-oat*) printf '999'; exit 0 ;;
+  esac
+  prev="$a"
+done
+haystack="$*"
+[ "$stdin_cfg" = "1" ] && haystack="$haystack $(cat)"
+case "$haystack" in
+  *EXPIRED*)          code="401" ;;
+  *FORBIDDEN*)        code="403" ;;
+  *QUOTE\"-TOKEN*)    code="998" ;;
+  *DOWN*)             code="000" ;;
+esac
+case "$haystack" in
+  *OTHERORG*) org="org-elsewhere" ;;
+  *NOORG*)    org="" ;;
+esac
+if [ -n "$hdr" ] && [ "$code" != "000" ]; then
+  printf 'HTTP/2 %s\r\n' "$code" >"$hdr"
+fi
+if [ -n "$hdr" ] && [ "$code" != "000" ] && [ -n "$org" ]; then
+  printf 'HTTP/2 %s\r\nanthropic-organization-id: %s\r\n\r\n' "$code" "$org" >"$hdr"
+fi
+printf '%s' "$code"
+SH
+  chmod +x "$SANDBOX/bin/curl"
 }
 
 #------------------------------------------------------------------- tests
@@ -479,6 +537,8 @@ t_use_happy_path() {
   assert_contains "use prints email" "$out" "personal@example.com"
   assert_eq "_CS_PROFILE set" "${_CS_PROFILE:-}" "personal"
   assert_eq "CLAUDE_CODE_OAUTH_TOKEN exported" "${CLAUDE_CODE_OAUTH_TOKEN:-}" "sk-ant-oat01-FAKE-TOKEN-FOR-TESTS"
+  zsh -c '[[ "$_CS_PROFILE" == "personal" && "$CLAUDE_CODE_OAUTH_TOKEN" == "sk-ant-oat01-FAKE-TOKEN-FOR-TESTS" ]]'
+  assert_eq "_CS_PROFILE exported for child shells" "$?" "0"
   teardown
 }
 
@@ -490,6 +550,22 @@ t_off_unsets() {
   cs off >/dev/null 2>&1
   assert_eq "_CS_PROFILE unset" "${_CS_PROFILE:-_NONE_}" "_NONE_"
   assert_eq "CLAUDE_CODE_OAUTH_TOKEN unset" "${CLAUDE_CODE_OAUTH_TOKEN:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_off_unpinned_does_not_restore_other_shell_patch() {
+  echo "[off: unpinned shell has no shared restore side effect]"
+  setup
+  seed_profile work
+  cs use work >/dev/null 2>&1
+  claude >/dev/null 2>&1
+  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN
+
+  cs off >/dev/null 2>&1
+  local email
+  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
+  assert_eq "unpinned cs off leaves another shell's patch alone" "$email" "work@example.com"
+  assert_file_exists "last-patch marker kept after unpinned cs off" "$HOME/.claude/accounts/.cs-last-patch.json"
   teardown
 }
 
@@ -514,28 +590,9 @@ t_list() {
   teardown
 }
 
-# Install a fake curl that emulates the API's HTTP status line. It inspects its
-# args for the bearer token and prints a code: tokens containing "EXPIRED" ->
-# 401, "DOWN" -> 000 (unreachable), otherwise 200. Matches the real curl's
-# `-w '%{http_code}'` contract (code on stdout, body discarded via -o).
-stub_curl() {
-  cat >"$SANDBOX/bin/curl" <<'SH'
-#!/bin/sh
-for a in "$@"; do
-  case "$a" in
-    *EXPIRED*) printf '401'; exit 0 ;;
-    *DOWN*)    printf '000'; exit 0 ;;
-  esac
-done
-printf '200'
-SH
-  chmod +x "$SANDBOX/bin/curl"
-}
-
 t_doctor() {
   echo "[doctor: validates tokens against API]"
   setup
-  stub_curl
   local out
   out="$(cs doctor 2>&1)"
   assert_contains "doctor with no profiles" "$out" "no profiles"
@@ -547,12 +604,20 @@ t_doctor() {
   out="$(cs doctor 2>&1)"
   assert_contains "healthy token reported OK" "$out" "personal@example.com: OK"
   assert_contains "expired token reported EXPIRED" "$out" "work@example.com: EXPIRED (401)"
-  assert_contains "unreachable token reported" "$out" "dead@example.com: UNREACHABLE"
+  assert_contains "unreachable token reported unverified" "$out" "dead@example.com: UNREACHABLE (no network/curl) — NOT VERIFIED"
   assert_contains "expired triggers re-mint hint" "$out" "cs save <name> --force"
 
   # Non-zero exit when any token is expired (for scripting).
   cs doctor >/dev/null 2>&1
   assert_eq "doctor returns 1 when a token is expired" "$?" "1"
+
+  # Identity mismatch: token is live but belongs to a different org than the
+  # snapshot — must be flagged and fail the run.
+  seed_profile impostor sk-ant-oat01-OTHERORG-TOKEN
+  out="$(cs doctor 2>&1)"
+  assert_contains "mismatched profile flagged" "$out" "impostor — impostor@example.com: OK — ORG MISMATCH"
+  assert_contains "mismatch hint mentions re-save" "$out" "cs save <name> --force"
+  rm -f "$HOME/.claude/accounts/impostor."*
 
   # All-healthy run exits 0 and pins the * marker on the active profile.
   rm -f "$HOME/.claude/accounts/work."* "$HOME/.claude/accounts/dead."*
@@ -561,6 +626,34 @@ t_doctor() {
   assert_contains "active profile gets * marker" "$out" "* personal"
   cs doctor >/dev/null 2>&1
   assert_eq "doctor returns 0 when all healthy" "$?" "0"
+
+  # A mismatch alone (no expired tokens) must still fail the run.
+  seed_profile impostor sk-ant-oat01-OTHERORG-TOKEN
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor returns 1 on mismatch alone" "$?" "1"
+  rm -f "$HOME/.claude/accounts/impostor."*
+
+  # An indeterminate token check must fail even when no token is proven expired.
+  seed_profile dead sk-ant-oat01-DOWN-TOKEN
+  out="$(cs doctor 2>&1)"
+  assert_contains "doctor warns when token cannot be verified" "$out" "one or more tokens could not be verified"
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor returns 1 on unverified token alone" "$?" "1"
+  rm -f "$HOME/.claude/accounts/dead."*
+
+  # Missing org data must not pass identity checking silently.
+  seed_profile noorg sk-ant-oat01-NOORG-TOKEN
+  out="$(cs doctor 2>&1)"
+  assert_contains "doctor flags missing token org" "$out" "noorg — noorg@example.com: OK — IDENTITY UNKNOWN"
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor returns 1 on missing token org" "$?" "1"
+  rm -f "$HOME/.claude/accounts/noorg."*
+
+  seed_profile old sk-ant-oat01-VALID-TOKEN ""
+  out="$(cs doctor 2>&1)"
+  assert_contains "doctor flags missing snapshot org" "$out" "old — old@example.com: OK — IDENTITY UNKNOWN"
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor returns 1 on missing snapshot org" "$?" "1"
   teardown
 }
 
@@ -692,6 +785,140 @@ t_claude_wrapper_invalid_profile() {
   teardown
 }
 
+t_save_rejects_dead_token() {
+  echo "[save: dead token refused]"
+  setup
+  local out
+  out="$(printf 'sk-ant-oat01-EXPIRED-TOKEN' | cs save personal 2>&1)"
+  assert_contains "expired token refused" "$out" "not usable"
+  assert_file_absent "no token file for dead token" "$HOME/.claude/accounts/personal.token"
+  teardown
+}
+
+t_save_forbidden_token_saves_unverified() {
+  echo "[save: 403 verification is indeterminate, not expired]"
+  setup
+  local out
+  out="$(printf 'sk-ant-oat01-FORBIDDEN-TOKEN' | cs save personal 2>&1)"
+  assert_contains "403 verification warns" "$out" "could not verify the token (FORBIDDEN (403))"
+  assert_contains "403 verification still saves" "$out" "saved profile 'personal'"
+  assert_file_exists "token file written after 403" "$HOME/.claude/accounts/personal.token"
+  teardown
+}
+
+t_save_rejects_org_mismatch() {
+  echo "[save: token/snapshot identity mismatch refused]"
+  setup
+  local out
+  # Token authenticates as org-elsewhere; ~/.claude.json login is org-home.
+  out="$(printf 'sk-ant-oat01-OTHERORG-TOKEN' | cs save work 2>&1)"
+  assert_contains "mismatch refused" "$out" "identity mismatch"
+  assert_contains "mismatch names the CLI login" "$out" "before@example.com"
+  assert_contains "mismatch offers override" "$out" "--allow-mismatch"
+  assert_file_absent "no token file on mismatch" "$HOME/.claude/accounts/work.token"
+  assert_file_absent "no snapshot on mismatch" "$HOME/.claude/accounts/work.account.json"
+
+  # Explicit override saves, with a warning.
+  out="$(printf 'sk-ant-oat01-OTHERORG-TOKEN' | cs save work --allow-mismatch 2>&1)"
+  assert_contains "override warns" "$out" "Saving anyway"
+  assert_contains "override still reports success" "$out" "saved profile 'work'"
+  assert_file_exists "token saved with override" "$HOME/.claude/accounts/work.token"
+  teardown
+}
+
+t_save_rejects_unchecked_identity() {
+  echo "[save: unchecked token identity refused]"
+  setup
+  local out
+
+  out="$(printf 'sk-ant-oat01-NOORG-TOKEN' | cs save noorg 2>&1)"
+  assert_contains "missing token org refused" "$out" "could not verify token/account identity"
+  assert_contains "missing token org offers override" "$out" "--allow-mismatch"
+  assert_file_absent "no token file when token org is missing" "$HOME/.claude/accounts/noorg.token"
+
+  out="$(printf 'sk-ant-oat01-NOORG-TOKEN' | cs save noorg --allow-mismatch 2>&1)"
+  assert_contains "missing token org override warns" "$out" "saving anyway"
+  assert_contains "missing token org override succeeds" "$out" "saved profile 'noorg'"
+  rm -f "$HOME/.claude/accounts/noorg."*
+
+  local tmp
+  tmp="$(mktemp)"
+  jq 'del(.oauthAccount.organizationUuid)' "$HOME/.claude.json" >"$tmp" && mv "$tmp" "$HOME/.claude.json"
+  out="$(printf 'sk-ant-oat01-VALID-TOKEN' | cs save old 2>&1)"
+  assert_contains "missing snapshot org refused" "$out" "could not verify token/account identity"
+  assert_file_absent "no token file when snapshot org is missing" "$HOME/.claude/accounts/old.token"
+  teardown
+}
+
+t_save_unreachable_saves_with_warning() {
+  echo "[save: unreachable API saves unverified]"
+  setup
+  local out
+  out="$(printf 'sk-ant-oat01-DOWN-TOKEN' | cs save personal 2>&1)"
+  assert_contains "offline save warns" "$out" "could not verify"
+  assert_contains "offline save succeeds" "$out" "saved profile 'personal'"
+  assert_file_exists "token saved offline" "$HOME/.claude/accounts/personal.token"
+  teardown
+}
+
+t_save_escapes_curl_config_token() {
+  echo "[save: curl config escapes token metacharacters]"
+  setup
+  local out token
+  token='sk-ant-oat01-QUOTE"-TOKEN'
+  out="$(printf '%s' "$token" | cs save quoted 2>&1)"
+  assert_not_contains "quote did not break curl config verification" "$out" "could not verify"
+  assert_contains "quoted token saved after verification" "$out" "saved profile 'quoted'"
+  teardown
+}
+
+t_claude_wrapper_unpinned_restores_keychain() {
+  echo "[claude wrapper: unpinned launch restores keychain identity]"
+  setup
+  seed_profile work
+  cs use work >/dev/null 2>&1
+  claude >/dev/null 2>&1
+  local email
+  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
+  assert_eq "pinned launch shows profile identity" "$email" "work@example.com"
+
+  # cs off must undo the cosmetic patch so plain `claude` shows the truth.
+  cs off >/dev/null 2>&1
+  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
+  assert_eq "cs off restores keychain identity" "$email" "before@example.com"
+  assert_file_absent "last-patch marker cleared" "$HOME/.claude/accounts/.cs-last-patch.json"
+
+  # And again via an unpinned launch (fresh shell scenario: patch is stale
+  # but _CS_PROFILE was never set here).
+  cs use work >/dev/null 2>&1
+  claude >/dev/null 2>&1
+  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN
+  claude >/dev/null 2>&1
+  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
+  assert_eq "unpinned launch restores keychain identity" "$email" "before@example.com"
+  teardown
+}
+
+t_claude_wrapper_restore_respects_relogin() {
+  echo "[claude wrapper: restore never clobbers a real /login]"
+  setup
+  seed_profile work
+  cs use work >/dev/null 2>&1
+  claude >/dev/null 2>&1
+  # Simulate the user running /login to a new account after the patch: the
+  # oauthAccount no longer matches what cs wrote.
+  local tmp
+  tmp="$(mktemp)"
+  jq '.oauthAccount = {"emailAddress":"fresh-login@example.com","organizationUuid":"org-fresh"}' \
+    "$HOME/.claude.json" >"$tmp" && mv "$tmp" "$HOME/.claude.json"
+  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN
+  claude >/dev/null 2>&1
+  local email
+  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
+  assert_eq "real login left untouched" "$email" "fresh-login@example.com"
+  teardown
+}
+
 t_claude_wrapper_skips_symlink_cfg() {
   echo "[claude wrapper: skips patch when ~/.claude.json is a symlink]"
   setup
@@ -742,9 +969,18 @@ t_rm_nonexistent
 t_rm_aborted_no
 t_rm_confirmed_yes
 t_rm_pinned_clears_env
+t_off_unpinned_does_not_restore_other_shell_patch
+t_save_rejects_dead_token
+t_save_forbidden_token_saves_unverified
+t_save_rejects_org_mismatch
+t_save_rejects_unchecked_identity
+t_save_unreachable_saves_with_warning
+t_save_escapes_curl_config_token
 t_claude_wrapper_unpinned_passthrough
 t_claude_wrapper_pinned_patches_json
 t_claude_wrapper_invalid_profile
+t_claude_wrapper_unpinned_restores_keychain
+t_claude_wrapper_restore_respects_relogin
 t_claude_wrapper_skips_symlink_cfg
 
 #------------------------------------------------------------------- summary
