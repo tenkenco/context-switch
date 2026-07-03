@@ -121,6 +121,15 @@ JSON
   mkdir -p "$SANDBOX/bin"
   cat >"$SANDBOX/bin/claude" <<'SH'
 #!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "login" ]; then
+  [ -n "${CLAUDE_CODE_OAUTH_TOKEN-}" ] && printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" >"${HOME}/.auth-login-token-env"
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+  cat >"$CLAUDE_CONFIG_DIR/.claude.json" <<JSON
+{"oauthAccount":{"emailAddress":"login@example.com","organizationRateLimitTier":"tier_login","organizationUuid":"org-login","accountUuid":"uuid-login"}}
+JSON
+  printf 'FAKE_CLAUDE_AUTH_LOGIN: %s\n' "$*"
+  exit 0
+fi
 printf 'FAKE_CLAUDE: %s\n' "$*"
 SH
   cat >"$SANDBOX/bin/pbpaste" <<'SH'
@@ -137,11 +146,12 @@ SH
   # fake curl, not just doctor's.
   stub_curl
   # Reset shell state and source under test
-  unset CLAUDE_CODE_OAUTH_TOKEN _CS_PROFILE _CS_TOKEN_SOURCE TEST_CLIPBOARD 2>/dev/null
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE _CS_TOKEN_SOURCE TEST_CLIPBOARD 2>/dev/null
   unfunction cs claude _cs_validate_name _cs_stat_mode _cs_paste _cs_copy \
     _cs_have_clipboard _cs_oauth_account_json _cs_read_token \
+    _cs_profile_config_dir _cs_profile_login_marker _cs_config_file _cs_profile_has_full_login \
     _cs_save _cs_use _cs_off _cs_list _cs_check_token _cs_doctor \
-    _cs_current _cs_rm _cs_help _cs_profile_account_file _cs_profile_email \
+    _cs_current _cs_rm _cs_login _cs_help _cs_profile_account_file _cs_profile_email \
     _cs_keychain_stash_file _cs_last_patch_file _cs_write_oauth_account \
     _cs_patch_oauth_account_for_profile _cs_restore_keychain_account 2>/dev/null
   source "$CS_ZSH"
@@ -154,7 +164,7 @@ SH
 
 teardown() {
   [[ -n "${SANDBOX:-}" && -d "$SANDBOX" ]] && rm -rf "$SANDBOX"
-  unset CLAUDE_CODE_OAUTH_TOKEN _CS_PROFILE TEST_CLIPBOARD SANDBOX 2>/dev/null
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE TEST_CLIPBOARD SANDBOX 2>/dev/null
   # Restore PATH (best effort — only matters if the runner reuses this shell)
   PATH="${PATH#*:}"
 }
@@ -171,6 +181,20 @@ seed_profile() {
 {"emailAddress":"$name@example.com","organizationRateLimitTier":"tier_$name","organizationUuid":"$org","accountUuid":"uuid-$name"}
 JSON
   chmod 600 "$HOME/.claude/accounts/$name.token" "$HOME/.claude/accounts/$name.account.json"
+}
+
+seed_full_login_profile() {
+  local name="$1" email="${2:-$1@example.com}" tier="${3:-tier_$name}" org="${4:-org-$name}"
+  local cfg_dir="$HOME/.claude/profiles/$name"
+  mkdir -p "$cfg_dir" "$HOME/.claude/accounts"
+  cat >"$cfg_dir/.claude.json" <<JSON
+{"oauthAccount":{"emailAddress":"$email","organizationRateLimitTier":"$tier","organizationUuid":"$org","accountUuid":"uuid-$name"}}
+JSON
+  cat >"$HOME/.claude/accounts/$name.account.json" <<JSON
+{"emailAddress":"$email","organizationRateLimitTier":"$tier","organizationUuid":"$org","accountUuid":"uuid-$name"}
+JSON
+  printf '1\n' >"$cfg_dir/.cs-full-login"
+  chmod 600 "$cfg_dir/.claude.json" "$cfg_dir/.cs-full-login" "$HOME/.claude/accounts/$name.account.json"
 }
 
 # Install a fake curl that emulates the API. The bearer token arrives via the
@@ -510,21 +534,16 @@ t_use_invalid_name() {
 }
 
 t_use_missing_files() {
-  echo "[use: missing files report cleanly]"
+  echo "[use: missing profile reports cleanly]"
   setup
   local out
   out="$(cs use ghost 2>&1)"
-  assert_contains "missing token file detected" "$out" "missing token"
-  # Now create only token, not account
-  mkdir -p "$HOME/.claude/accounts"
-  printf 'sk-ant-oat01-x' >"$HOME/.claude/accounts/half.token"
-  out="$(cs use half 2>&1)"
-  assert_contains "missing account snapshot detected" "$out" "missing account snapshot"
+  assert_contains "missing profile detected" "$out" "not set up"
   teardown
 }
 
 t_use_happy_path() {
-  echo "[use: happy path exports env var]"
+  echo "[use: legacy token path exports token and config dir]"
   setup
   seed_profile personal
   # IMPORTANT: cannot use `out=$(cs use ...)` — that runs cs use in a subshell,
@@ -536,9 +555,58 @@ t_use_happy_path() {
   out="$(<"$SANDBOX/.use.out")"
   assert_contains "use prints email" "$out" "personal@example.com"
   assert_eq "_CS_PROFILE set" "${_CS_PROFILE:-}" "personal"
+  assert_eq "CLAUDE_CONFIG_DIR exported" "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude/profiles/personal"
   assert_eq "CLAUDE_CODE_OAUTH_TOKEN exported" "${CLAUDE_CODE_OAUTH_TOKEN:-}" "sk-ant-oat01-FAKE-TOKEN-FOR-TESTS"
-  zsh -c '[[ "$_CS_PROFILE" == "personal" && "$CLAUDE_CODE_OAUTH_TOKEN" == "sk-ant-oat01-FAKE-TOKEN-FOR-TESTS" ]]'
-  assert_eq "_CS_PROFILE exported for child shells" "$?" "0"
+  zsh -c '[[ "$_CS_PROFILE" == "personal" && "$CLAUDE_CONFIG_DIR" == "$HOME/.claude/profiles/personal" && "$CLAUDE_CODE_OAUTH_TOKEN" == "sk-ant-oat01-FAKE-TOKEN-FOR-TESTS" ]]'
+  assert_eq "profile env exported for child shells" "$?" "0"
+  teardown
+}
+
+t_use_full_login_prefers_config() {
+  echo "[use: full login path does not export setup token]"
+  setup
+  seed_profile work
+  seed_full_login_profile work work@example.com tier_work org-work
+  cs use work >|"$SANDBOX/.use.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.use.out")"
+  assert_contains "use reports isolated login" "$out" "isolated claude.ai login"
+  assert_eq "_CS_PROFILE set" "${_CS_PROFILE:-}" "work"
+  assert_eq "CLAUDE_CONFIG_DIR exported" "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude/profiles/work"
+  assert_eq "CLAUDE_CODE_OAUTH_TOKEN not exported for full login" "${CLAUDE_CODE_OAUTH_TOKEN:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_use_legacy_profile_stays_token_after_wrapper_patch() {
+  echo "[use: legacy token path is not promoted by wrapper patch]"
+  setup
+  seed_profile personal
+  cs use personal >/dev/null 2>&1
+  claude >/dev/null 2>&1
+  cs off >/dev/null 2>&1
+
+  cs use personal >|"$SANDBOX/.use.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.use.out")"
+  assert_contains "use still reports setup-token fallback" "$out" "setup-token fallback"
+  assert_eq "legacy profile keeps token exported" "${CLAUDE_CODE_OAUTH_TOKEN:-}" "sk-ant-oat01-FAKE-TOKEN-FOR-TESTS"
+  assert_file_absent "legacy wrapper patch does not create full-login marker" "$HOME/.claude/profiles/personal/.cs-full-login"
+  teardown
+}
+
+t_login_does_not_inherit_setup_token() {
+  echo "[login: full auth login does not inherit setup-token env]"
+  setup
+  seed_profile personal
+  cs use personal >/dev/null 2>&1
+
+  local out
+  out="$(cs login work --claudeai 2>&1)"
+  assert_contains "login invokes claude auth login" "$out" "FAKE_CLAUDE_AUTH_LOGIN: auth login --claudeai"
+  assert_file_absent "auth login subprocess did not inherit setup token" "$HOME/.auth-login-token-env"
+  assert_file_exists "full login marker written" "$HOME/.claude/profiles/work/.cs-full-login"
+  assert_file_mode "full login marker mode 600" "$HOME/.claude/profiles/work/.cs-full-login" "600"
+  assert_eq "current shell still has original setup token" "${CLAUDE_CODE_OAUTH_TOKEN:-}" "sk-ant-oat01-FAKE-TOKEN-FOR-TESTS"
   teardown
 }
 
@@ -550,6 +618,7 @@ t_off_unsets() {
   cs off >/dev/null 2>&1
   assert_eq "_CS_PROFILE unset" "${_CS_PROFILE:-_NONE_}" "_NONE_"
   assert_eq "CLAUDE_CODE_OAUTH_TOKEN unset" "${CLAUDE_CODE_OAUTH_TOKEN:-_NONE_}" "_NONE_"
+  assert_eq "CLAUDE_CONFIG_DIR unset" "${CLAUDE_CONFIG_DIR:-_NONE_}" "_NONE_"
   teardown
 }
 
@@ -559,13 +628,13 @@ t_off_unpinned_does_not_restore_other_shell_patch() {
   seed_profile work
   cs use work >/dev/null 2>&1
   claude >/dev/null 2>&1
-  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN
+  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR
 
   cs off >/dev/null 2>&1
   local email
   email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
-  assert_eq "unpinned cs off leaves another shell's patch alone" "$email" "work@example.com"
-  assert_file_exists "last-patch marker kept after unpinned cs off" "$HOME/.claude/accounts/.cs-last-patch.json"
+  assert_eq "unpinned cs off leaves another shell's patch alone" "$email" "before@example.com"
+  assert_file_absent "global last-patch marker absent for isolated profile" "$HOME/.claude/accounts/.cs-last-patch.json"
   teardown
 }
 
@@ -670,7 +739,7 @@ t_current() {
 
   unset _CS_PROFILE
   out="$(cs current 2>&1)"
-  assert_contains "current warns on token/profile mismatch" "$out" "token set, profile unknown"
+  assert_contains "current warns on config/profile mismatch" "$out" "profile config set, name unknown"
   assert_contains "current mismatch includes recovery hint" "$out" "re-run: cs use <name>"
   teardown
 }
@@ -728,9 +797,11 @@ t_rm_confirmed_yes() {
   echo "[rm: confirming the prompt deletes both files]"
   setup
   seed_profile personal
+  seed_full_login_profile personal
   printf 'y\n' | cs rm personal >/dev/null 2>&1
   assert_file_absent "token removed" "$HOME/.claude/accounts/personal.token"
   assert_file_absent "account snapshot removed" "$HOME/.claude/accounts/personal.account.json"
+  assert_file_absent "profile config removed" "$HOME/.claude/profiles/personal"
   teardown
 }
 
@@ -742,6 +813,7 @@ t_rm_pinned_clears_env() {
   printf 'y\n' | cs rm personal >/dev/null 2>&1
   assert_eq "_CS_PROFILE cleared" "${_CS_PROFILE:-_NONE_}" "_NONE_"
   assert_eq "CLAUDE_CODE_OAUTH_TOKEN cleared" "${CLAUDE_CODE_OAUTH_TOKEN:-_NONE_}" "_NONE_"
+  assert_eq "CLAUDE_CONFIG_DIR cleared" "${CLAUDE_CONFIG_DIR:-_NONE_}" "_NONE_"
   teardown
 }
 
@@ -756,7 +828,7 @@ t_claude_wrapper_unpinned_passthrough() {
 }
 
 t_claude_wrapper_pinned_patches_json() {
-  echo "[claude wrapper: pinned patches ~/.claude.json]"
+  echo "[claude wrapper: pinned patches active profile config]"
   setup
   seed_profile personal
   cs use personal >/dev/null 2>&1
@@ -764,13 +836,12 @@ t_claude_wrapper_pinned_patches_json() {
   out="$(claude foo 2>&1)"
   assert_contains "wrapper announces profile" "$out" "launching claude as 'personal'"
   assert_contains "fake claude got args" "$out" "FAKE_CLAUDE: foo"
-  # Verify ~/.claude.json oauthAccount was rewritten
+  # Verify the active profile config's oauthAccount was rewritten.
   local email
-  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
+  email="$(jq -r '.oauthAccount.emailAddress' "$CLAUDE_CONFIG_DIR/.claude.json")"
   assert_eq "oauthAccount email patched to profile's" "$email" "personal@example.com"
-  local preserved
-  preserved="$(jq -r '.unrelatedKey' "$HOME/.claude.json")"
-  assert_eq "unrelated json keys preserved" "$preserved" "must_be_preserved"
+  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
+  assert_eq "global oauthAccount untouched" "$email" "before@example.com"
   teardown
 }
 
@@ -873,59 +944,57 @@ t_save_escapes_curl_config_token() {
 }
 
 t_claude_wrapper_unpinned_restores_keychain() {
-  echo "[claude wrapper: unpinned launch restores keychain identity]"
+  echo "[claude wrapper: pinned launch leaves global config untouched]"
   setup
   seed_profile work
   cs use work >/dev/null 2>&1
   claude >/dev/null 2>&1
   local email
   email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
-  assert_eq "pinned launch shows profile identity" "$email" "work@example.com"
+  assert_eq "global config untouched by pinned launch" "$email" "before@example.com"
+  email="$(jq -r '.oauthAccount.emailAddress' "$CLAUDE_CONFIG_DIR/.claude.json")"
+  assert_eq "profile config shows profile identity" "$email" "work@example.com"
 
-  # cs off must undo the cosmetic patch so plain `claude` shows the truth.
   cs off >/dev/null 2>&1
   email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
-  assert_eq "cs off restores keychain identity" "$email" "before@example.com"
-  assert_file_absent "last-patch marker cleared" "$HOME/.claude/accounts/.cs-last-patch.json"
+  assert_eq "cs off leaves global config untouched" "$email" "before@example.com"
+  assert_file_exists "profile config remains for future use" "$HOME/.claude/profiles/work/.claude.json"
 
-  # And again via an unpinned launch (fresh shell scenario: patch is stale
-  # but _CS_PROFILE was never set here).
-  cs use work >/dev/null 2>&1
-  claude >/dev/null 2>&1
-  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN
+  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR
   claude >/dev/null 2>&1
   email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
-  assert_eq "unpinned launch restores keychain identity" "$email" "before@example.com"
+  assert_eq "unpinned launch still uses global config" "$email" "before@example.com"
   teardown
 }
 
 t_claude_wrapper_restore_respects_relogin() {
-  echo "[claude wrapper: restore never clobbers a real /login]"
+  echo "[claude wrapper: profile relogin stays profile-local]"
   setup
   seed_profile work
   cs use work >/dev/null 2>&1
   claude >/dev/null 2>&1
-  # Simulate the user running /login to a new account after the patch: the
-  # oauthAccount no longer matches what cs wrote.
+  # Simulate the user running /login inside the isolated profile.
   local tmp
   tmp="$(mktemp)"
   jq '.oauthAccount = {"emailAddress":"fresh-login@example.com","organizationUuid":"org-fresh"}' \
-    "$HOME/.claude.json" >"$tmp" && mv "$tmp" "$HOME/.claude.json"
-  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN
+    "$CLAUDE_CONFIG_DIR/.claude.json" >"$tmp" && mv "$tmp" "$CLAUDE_CONFIG_DIR/.claude.json"
+  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR
   claude >/dev/null 2>&1
   local email
   email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
-  assert_eq "real login left untouched" "$email" "fresh-login@example.com"
+  assert_eq "global config left untouched" "$email" "before@example.com"
+  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude/profiles/work/.claude.json")"
+  assert_eq "profile relogin left untouched" "$email" "fresh-login@example.com"
   teardown
 }
 
 t_claude_wrapper_skips_symlink_cfg() {
-  echo "[claude wrapper: skips patch when ~/.claude.json is a symlink]"
+  echo "[claude wrapper: skips patch when active profile config is a symlink]"
   setup
   seed_profile personal
   cs use personal >/dev/null 2>&1
-  rm "$HOME/.claude.json"
-  ln -s "$HOME/elsewhere.json" "$HOME/.claude.json"
+  rm -f "$CLAUDE_CONFIG_DIR/.claude.json"
+  ln -s "$HOME/elsewhere.json" "$CLAUDE_CONFIG_DIR/.claude.json"
   local out
   out="$(claude 2>&1)"
   assert_contains "symlink warning emitted" "$out" "symlink"
@@ -959,6 +1028,9 @@ t_save_clipboard_clears_after_use
 t_use_invalid_name
 t_use_missing_files
 t_use_happy_path
+t_use_full_login_prefers_config
+t_use_legacy_profile_stays_token_after_wrapper_patch
+t_login_does_not_inherit_setup_token
 t_off_unsets
 t_list
 t_doctor

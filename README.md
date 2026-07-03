@@ -18,18 +18,16 @@ Each terminal stays pinned to its own account.
 ## Why this exists
 
 Switching between Claude accounts all day is annoying, especially when the accounts have MFA enabled and you constantly hit rate limits.
-You log in here, log out there, and eventually lose track of which terminal is using which identity. `claude-switch` fixes that by pinning one token per shell.
+You log in here, log out there, and eventually lose track of which terminal is using which identity. `claude-switch` fixes that by pinning one isolated Claude Code config per shell.
 
 ## How it works
 
-1. `cs save <name>` stores:
-   - a setup token (`claude setup-token`)
-   - a snapshot of `oauthAccount` from `~/.claude.json`
-   - a save-time token/account check when `curl` is available
-2. `cs use <name>` sets that token in the current shell only.
-3. The `claude` wrapper updates `oauthAccount` in `~/.claude.json` so `/status` matches the pinned account.
+1. `cs login <name>` runs `claude auth login` with `CLAUDE_CONFIG_DIR` pointed at `~/.claude/profiles/<name>`.
+2. Claude Code stores that account's full `claude.ai` login state inside the profile config namespace.
+3. `cs use <name>` sets `CLAUDE_CONFIG_DIR` in the current shell only.
+4. The `claude` wrapper updates that profile config's `oauthAccount` so `/status` matches the pinned account.
 
-Auth comes from the env var token. The file update is display-only.
+Legacy `cs save <name>` setup-token profiles are still supported as a fallback, but full Claude Code Max behavior should use `cs login`.
 
 ## Requirements
 
@@ -87,11 +85,19 @@ Then open a new terminal (or `source ~/.zshrc`) and run `cs help`.
 ## One-time setup (per account)
 
 ```sh
-# Login to account A in Claude Code first
-claude setup-token | cs save personal
+# Login to account A inside an isolated profile
+cs login personal --claudeai --email you@example.com
 
-# Login to account B
-claude setup-token | cs save work
+# Login to account B inside a different isolated profile
+cs login work --claudeai --email you@work.com
+```
+
+Each login opens Claude's normal browser OAuth flow once. After that, daily switching uses the saved isolated config.
+
+Legacy setup-token fallback:
+
+```sh
+claude setup-token | cs save personal
 ```
 
 `cs save` verifies that the token is live and that the token's account matches the CLI login snapshot. If you intentionally want to save a token whose account cannot be checked or differs from the snapshot, add `--allow-mismatch`.
@@ -114,9 +120,11 @@ cs rm work
 ## Notes
 
 - ⚠️ Setup tokens are CI-style auth: inference works, but default model/MCP behavior can differ from full interactive login.
+- ✅ `cs login` profiles use Claude Code's full `claude.ai` login path in an isolated config directory.
 - 🩺 Run `cs doctor` to validate saved tokens and catch expired-token fallback or account mismatches.
-- 🖥️ CLI-only: desktop app and IDE extensions do not inherit your shell env var.
+- 🖥️ CLI-only: desktop app and IDE extensions do not inherit your shell's `CLAUDE_CONFIG_DIR`.
 - 🔐 `~/.claude/accounts/*.token` are bearer credentials. Protect them like API keys.
+- 🔐 `~/.claude/profiles/<name>` contains full Claude Code login state. Protect it like your normal Claude config.
 - 🧩 This tool depends on Claude Code internals, so future Claude releases may require updates.
 
 ## Tests
@@ -125,7 +133,7 @@ cs rm work
 ./tests/smoke.zsh
 ```
 
-Covers profile validation, save/use/off/list/current/rm/doctor flows, save-time token verification, keychain display restore, wrapper behavior, and security checks.
+Covers profile validation, login/use/off/list/current/rm/doctor flows, save-time token verification, isolated profile config behavior, wrapper behavior, and security checks.
 CI runs this suite on both macOS and Ubuntu in `.github/workflows/test.yml`.
 
 ## Design notes

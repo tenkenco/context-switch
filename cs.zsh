@@ -9,14 +9,14 @@
 #   4. Run claude in that terminal:            claude
 #
 # How it works:
-#   `cs use <name>` exports CLAUDE_CODE_OAUTH_TOKEN in this shell only. Claude
-#   Code reads the env var first and never touches the macOS Keychain on the
-#   auth path, so two terminals with two different `cs use` values stay
-#   isolated — no drift, no refresh-clobber, even in multi-hour sessions.
+#   `cs use <name>` exports a per-profile CLAUDE_CONFIG_DIR in this shell only.
+#   Claude Code stores full login state inside that profile-specific config
+#   namespace, so two terminals with two different `cs use` values stay
+#   isolated. Legacy setup-token profiles still work as a fallback.
 #
-#   The `claude` wrapper also patches ~/.claude.json's oauthAccount field from
-#   the profile snapshot before launch so /status displays the right email.
-#   That patch is cosmetic; auth comes from the env var.
+#   The `claude` wrapper also patches the active profile config's oauthAccount
+#   field from the profile snapshot before launch so /status displays the
+#   right email.
 #
 # Supported platforms:
 #   - macOS (uses pbpaste/pbcopy + BSD stat)
@@ -83,10 +83,39 @@ _cs_have_clipboard() { [[ -n "$_CS_PASTE_CMD" ]]; }
 _cs_paste() { eval "$_CS_PASTE_CMD"; }
 _cs_copy() { eval "$_CS_COPY_CMD"; }
 
-# Read the oauthAccount JSON object from ~/.claude.json. Echoes the JSON or
+# Per-profile config root. Claude Code honors CLAUDE_CONFIG_DIR for both the
+# visible ~/.claude.json equivalent and the full claude.ai auth namespace.
+_cs_profile_config_dir() {
+  local profile="$1"
+  printf '%s' "$HOME/.claude/profiles/$profile"
+}
+
+_cs_profile_login_marker() {
+  local profile="$1"
+  printf '%s' "$(_cs_profile_config_dir "$profile")/.cs-full-login"
+}
+
+_cs_config_file() {
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    printf '%s' "$CLAUDE_CONFIG_DIR/.claude.json"
+  else
+    printf '%s' "$HOME/.claude.json"
+  fi
+}
+
+_cs_profile_has_full_login() {
+  local profile="$1" cfg marker
+  cfg="$(_cs_profile_config_dir "$profile")/.claude.json"
+  marker="$(_cs_profile_login_marker "$profile")"
+  [[ -f "$marker" && -f "$cfg" ]] || return 1
+  jq -e '.oauthAccount.emailAddress? // empty' "$cfg" >/dev/null 2>&1
+}
+
+# Read the oauthAccount JSON object from the active Claude config. Echoes JSON or
 # nothing if the file or the key is missing. Errors handled by caller.
 _cs_oauth_account_json() {
-  local cfg="$HOME/.claude.json"
+  local cfg
+  cfg="$(_cs_config_file)"
   [[ -f "$cfg" ]] || return 1
   jq -c '.oauthAccount // empty' "$cfg" 2>/dev/null
 }
@@ -149,7 +178,8 @@ _cs_read_token() {
 
 _cs_save() {
   local dir="$HOME/.claude/accounts"
-  local user_cfg="$HOME/.claude.json"
+  local user_cfg
+  user_cfg="$(_cs_config_file)"
   mkdir -p "$dir"
   chmod 700 "$dir"
 
@@ -313,40 +343,120 @@ _cs_use() {
     return 1
   }
 
-  local tok_file="$dir/$name.token" acct_file="$dir/$name.account.json"
-  [[ -f "$tok_file" ]] || {
-    echo "cs: profile '$name' missing token ($tok_file). Run: cs save $name" >&2
+  local tok_file="$dir/$name.token" acct_file="$dir/$name.account.json" cfg_dir
+  cfg_dir="$(_cs_profile_config_dir "$name")"
+  if [[ ! -f "$tok_file" && ! -d "$cfg_dir" ]]; then
+    echo "cs: profile '$name' is not set up. Run: cs login $name" >&2
     return 1
-  }
-  [[ -f "$acct_file" ]] || {
-    echo "cs: profile '$name' missing account snapshot ($acct_file). Run: cs save $name --force" >&2
-    return 1
-  }
+  fi
 
-  local token
-  token="$(<"$tok_file")"
-  export CLAUDE_CODE_OAUTH_TOKEN="$token"
   export _CS_PROFILE="$name"
-  local email
-  email="$(jq -r '.emailAddress // "?"' "$acct_file" 2>/dev/null)"
-  echo "cs: this shell pinned to '$name' ($email). Run 'claude' to launch."
+  export CLAUDE_CONFIG_DIR="$cfg_dir"
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+
+  local email source token
+  email="?"
+  [[ -f "$acct_file" ]] && email="$(jq -r '.emailAddress // "?"' "$acct_file" 2>/dev/null)"
+  if _cs_profile_has_full_login "$name"; then
+    unset CLAUDE_CODE_OAUTH_TOKEN
+    source="isolated claude.ai login"
+    email="$(jq -r '.oauthAccount.emailAddress // "?"' "$CLAUDE_CONFIG_DIR/.claude.json" 2>/dev/null)"
+  elif [[ -f "$tok_file" ]]; then
+    token="$(<"$tok_file")"
+    export CLAUDE_CODE_OAUTH_TOKEN="$token"
+    source="setup-token fallback"
+  else
+    unset CLAUDE_CODE_OAUTH_TOKEN
+    source="empty isolated config"
+  fi
+  echo "cs: this shell pinned to '$name' ($email, $source). Run 'claude' to launch."
 }
 
 _cs_off() {
   local was_pinned=0
-  [[ -n "${_CS_PROFILE:-}" || -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && was_pinned=1
-  unset CLAUDE_CODE_OAUTH_TOKEN _CS_PROFILE
+  [[ -n "${_CS_PROFILE:-}" || -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" || -n "${CLAUDE_CONFIG_DIR:-}" ]] && was_pinned=1
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE
   ((was_pinned)) && _cs_restore_keychain_account
-  echo "cs: this shell unpinned (env-var cleared)."
+  echo "cs: this shell unpinned (profile env cleared)."
+}
+
+_cs_login() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && {
+    echo "cs login <name> [claude auth login args...]" >&2
+    return 1
+  }
+  shift
+  _cs_validate_name "$name" || {
+    echo "cs: invalid profile name '$name'" >&2
+    return 1
+  }
+
+  local cfg_dir acct_file marker_file acct email tier
+  cfg_dir="$(_cs_profile_config_dir "$name")"
+  acct_file="$HOME/.claude/accounts/$name.account.json"
+  marker_file="$(_cs_profile_login_marker "$name")"
+  mkdir -p "$cfg_dir" "$HOME/.claude/accounts"
+  chmod 700 "$cfg_dir" "$HOME/.claude/accounts" 2>/dev/null
+
+  if (($# == 0)); then
+    set -- --claudeai
+    if [[ -f "$acct_file" ]] && command -v jq >/dev/null 2>&1; then
+      email="$(jq -r '.emailAddress // empty' "$acct_file" 2>/dev/null)"
+      [[ -n "$email" ]] && set -- "$@" --email "$email"
+    fi
+  fi
+
+  echo "cs: logging into isolated profile '$name' ($cfg_dir)" >&2
+  env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR="$cfg_dir" claude auth login "$@" || return $?
+
+  local old_config_dir="${CLAUDE_CONFIG_DIR:-}" had_config_dir=0
+  [[ -n "${CLAUDE_CONFIG_DIR+x}" ]] && had_config_dir=1
+  export CLAUDE_CONFIG_DIR="$cfg_dir"
+  acct="$(_cs_oauth_account_json)" || true
+  if ((had_config_dir)); then
+    export CLAUDE_CONFIG_DIR="$old_config_dir"
+  else
+    unset CLAUDE_CONFIG_DIR
+  fi
+  [[ -z "$acct" ]] && {
+    echo "cs: login completed but no oauthAccount was written in $cfg_dir/.claude.json" >&2
+    return 1
+  }
+  (
+    umask 077
+    printf '%s\n' "$acct" >"$acct_file"
+    printf '1\n' >"$marker_file"
+  )
+  chmod 600 "$acct_file" "$marker_file" 2>/dev/null
+  IFS=$'\t' read -r email tier <<<"$(printf '%s' "$acct" |
+    jq -r '[.emailAddress // "?", .organizationRateLimitTier // "?"] | @tsv' 2>/dev/null)"
+  echo "cs: saved isolated login for '$name' (email: $email, tier: $tier)"
 }
 
 _cs_list() {
   local dir="$HOME/.claude/accounts"
   setopt local_options null_glob
-  local found=0 f name marker email tier suffix
+  local found=0 f name marker email tier suffix cfg_dir source existing seen
+  local -a names
+  names=()
   for f in "$dir"/*.token; do
+    names+=("${f:t:r}")
+  done
+  for f in "$HOME/.claude/profiles"/*; do
+    [[ -d "$f" ]] || continue
+    name="${f:t}"
+    seen=0
+    for existing in "${names[@]}"; do
+      [[ "$existing" == "$name" ]] && {
+        seen=1
+        break
+      }
+    done
+    ((seen)) || names+=("$name")
+  done
+  for name in "${names[@]}"; do
     found=1
-    name="${f:t:r}"
     marker="  "
     [[ "$name" == "$_CS_PROFILE" ]] && marker="* "
     suffix=""
@@ -355,11 +465,20 @@ _cs_list() {
       tier="$(jq -r '.organizationRateLimitTier // "?"' "$dir/$name.account.json" 2>/dev/null)"
       suffix=" — $email ($tier)"
     else
-      suffix=" — incomplete (re-run: cs save $name --force)"
+      suffix=" — incomplete"
     fi
+    cfg_dir="$(_cs_profile_config_dir "$name")"
+    if _cs_profile_has_full_login "$name"; then
+      source="isolated login"
+    elif [[ -f "$dir/$name.token" ]]; then
+      source="setup-token"
+    else
+      source="empty config"
+    fi
+    suffix="$suffix [$source]"
     echo "${marker}${name}${suffix}"
   done
-  ((found)) || echo "(no profiles — run: cs save <name>)"
+  ((found)) || echo "(no profiles — run: cs login <name> or cs save <name>)"
 }
 
 # Validate a single token against the Anthropic API, bypassing the keychain.
@@ -512,11 +631,15 @@ _cs_current() {
     echo "$_CS_PROFILE"
     return 0
   fi
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    echo "(profile config set, name unknown — re-run: cs use <name>)"
+    return 0
+  fi
   if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
     echo "(token set, profile unknown — re-run: cs use <name>)"
     return 0
   fi
-  echo "(none — claude will use the keychain default)"
+  echo "(none — claude will use the default config)"
 }
 
 _cs_rm() {
@@ -531,8 +654,9 @@ _cs_rm() {
     return 1
   }
 
-  local tok_file="$dir/$name.token" acct_file="$dir/$name.account.json"
-  [[ -f "$tok_file" || -f "$acct_file" ]] || {
+  local tok_file="$dir/$name.token" acct_file="$dir/$name.account.json" cfg_dir
+  cfg_dir="$(_cs_profile_config_dir "$name")"
+  [[ -f "$tok_file" || -f "$acct_file" || -d "$cfg_dir" ]] || {
     echo "cs: no such profile: $name" >&2
     return 1
   }
@@ -544,8 +668,9 @@ _cs_rm() {
     return 0
   }
   rm -f "$tok_file" "$acct_file"
+  rm -rf "$cfg_dir"
   if [[ "$_CS_PROFILE" == "$name" ]]; then
-    unset CLAUDE_CODE_OAUTH_TOKEN _CS_PROFILE
+    unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE
   fi
   echo "cs: removed '$name'."
 }
@@ -555,13 +680,15 @@ _cs_help() {
 cs — per-terminal Claude Code subscription switcher.
 
 Usage:
+  cs login <name> [claude auth login args...]
+                             Log into a full isolated Claude Code profile.
   cs save <name> [--force] [--allow-mismatch]
-                             Bootstrap a profile (paste setup-token + snapshot account).
+                             Bootstrap a legacy setup-token profile.
                              Verifies the token is live AND belongs to the same account
                              as the CLI login being snapshotted; refuses on mismatch
                              unless --allow-mismatch.
-  cs use <name>              Export CLAUDE_CODE_OAUTH_TOKEN for THIS shell only.
-  cs off                     Unset the env var; subsequent `claude` uses keychain default.
+  cs use <name>              Pin THIS shell to the isolated profile.
+  cs off                     Unset the profile env; subsequent `claude` uses default config.
   cs list                    List profiles; * marks the one pinned in this shell.
   cs doctor                  Validate each saved token against the API (OK / EXPIRED /
                              ORG MISMATCH when a token belongs to a different account
@@ -570,6 +697,10 @@ Usage:
   cs rm <name>               Delete a saved profile.
 
 Bootstrap (once per account):
+  Preferred full Claude Code login:
+             cs login work --claudeai --email you@example.com
+
+  Legacy setup-token fallback:
   In Claude Code, /login to account A.
   Easiest:   claude setup-token | cs save personal
   Or copy/paste:
@@ -578,15 +709,15 @@ Bootstrap (once per account):
   /logout, /login to account B, repeat with `cs save work`.
 
 How it works:
-  - cs use <name> sets CLAUDE_CODE_OAUTH_TOKEN in your shell. Claude Code reads
-    the env var first and never touches the macOS Keychain on the auth path.
-    Two terminals with two different `cs use` are truly isolated — no drift,
-    no refresh-clobber, even in multi-hour sessions.
-  - The `claude` wrapper additionally patches ~/.claude.json's oauthAccount
-    field from the profile snapshot before launch, so /status displays the
-    right email. This is cosmetic; auth is the env var. Unpinned launches and
-    `cs off` restore the keychain account's identity so a plain `claude`
-    doesn't keep displaying the last pinned profile.
+  - cs login <name> runs `claude auth login` with CLAUDE_CONFIG_DIR pointed at
+    ~/.claude/profiles/<name>. That stores full Claude Code login state in a
+    profile-specific config namespace.
+  - cs use <name> sets CLAUDE_CONFIG_DIR for THIS shell. If the profile has a
+    full login, Claude uses that claude.ai login. If it only has a saved setup
+    token, cs falls back to CLAUDE_CODE_OAUTH_TOKEN.
+  - The `claude` wrapper additionally patches the active profile config's
+    oauthAccount field from the profile snapshot before launch, so /status
+    displays the right email.
 
 Caveats:
   - A setup-token belongs to the BROWSER session that approved the OAuth URL,
@@ -594,11 +725,10 @@ Caveats:
     the two match (via the token's anthropic-organization-id) and refuses on
     mismatch. Easiest way to stay consistent: /login the CLI to the account
     first, then run `claude setup-token | cs save <name>`.
-  - Setup-tokens are CI-tier auth. They authenticate fine for inference but
-    Claude Code may default to a non-Max model and show fewer MCPs / no
-    identity in /status. Use `/model opus` per session if needed.
-  - GUI clients (desktop app, IDE extensions) don't read shell env vars; they
-    use the keychain. CLI-only feature.
+  - Setup-tokens are fallback CI-tier auth. They authenticate fine for
+    inference but may not provide full Claude Code Max behavior.
+  - GUI clients (desktop app, IDE extensions) don't inherit your shell's
+    CLAUDE_CONFIG_DIR. CLI-only feature.
   - Two terminals launching `claude` at the literal same instant could race
     on the ~/.claude.json patch (cosmetic display only, not auth).
   - Re-run `cs save <name> --force` if a token eventually expires. Newer Claude
@@ -616,6 +746,7 @@ cs() {
   (($# > 0)) && shift
   case "$subcmd" in
   save) _cs_save "$@" ;;
+  login) _cs_login "$@" ;;
   use) _cs_use "$@" ;;
   off) _cs_off "$@" ;;
   list | ls) _cs_list "$@" ;;
@@ -631,9 +762,8 @@ cs() {
 }
 
 #==============================================================================
-# `claude` wrapper. Patches ~/.claude.json oauthAccount from the pinned
-# profile's snapshot so /status displays the correct email; auth is the env
-# var that `cs use` already exported.
+# `claude` wrapper. Patches the active profile config's oauthAccount from the
+# pinned profile's snapshot so /status displays the correct email.
 #==============================================================================
 
 _cs_profile_account_file() {
@@ -643,12 +773,24 @@ _cs_profile_account_file() {
 
 # State files for undoing the cosmetic patch:
 #   .keychain.account.json — last oauthAccount known to come from a real
-#                            /login (the keychain identity), not from cs.
+#                            /login in this config namespace, not from cs.
 #   .cs-last-patch.json    — exact oauthAccount JSON cs last wrote, so we can
 #                            tell "still our stale patch" from "user re-logged
 #                            in since" and never clobber a real login.
-_cs_keychain_stash_file() { printf '%s' "$HOME/.claude/accounts/.keychain.account.json"; }
-_cs_last_patch_file() { printf '%s' "$HOME/.claude/accounts/.cs-last-patch.json"; }
+_cs_keychain_stash_file() {
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    printf '%s' "$CLAUDE_CONFIG_DIR/.keychain.account.json"
+  else
+    printf '%s' "$HOME/.claude/accounts/.keychain.account.json"
+  fi
+}
+_cs_last_patch_file() {
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    printf '%s' "$CLAUDE_CONFIG_DIR/.cs-last-patch.json"
+  else
+    printf '%s' "$HOME/.claude/accounts/.cs-last-patch.json"
+  fi
+}
 
 _cs_profile_email() {
   local af="$1"
@@ -678,15 +820,23 @@ _cs_patch_oauth_account_for_profile() {
   local profile="$1"
   local af cfg
   af="$(_cs_profile_account_file "$profile")"
-  cfg="$HOME/.claude.json"
+  cfg="$(_cs_config_file)"
 
   if [[ -L "$cfg" ]]; then
-    echo "cs: warning — ~/.claude.json is a symlink; skipping oauthAccount patch (auth still uses env var)" >&2
+    echo "cs: warning — $cfg is a symlink; skipping oauthAccount patch (auth still uses profile config/env)" >&2
     return 0
   fi
-  [[ -f "$af" && -f "$cfg" ]] || return 0
+  [[ -f "$af" ]] || return 0
+  if [[ ! -e "$cfg" ]]; then
+    mkdir -p "${cfg:h}" 2>/dev/null
+    (
+      umask 077
+      printf '{}\n' >"$cfg"
+    ) || return 0
+  fi
+  [[ -f "$cfg" ]] || return 0
   if ! command -v jq >/dev/null 2>&1; then
-    echo "cs: warning — jq is required to patch ~/.claude.json (auth still uses env var)" >&2
+    echo "cs: warning — jq is required to patch $cfg (auth still uses profile config/env)" >&2
     return 0
   fi
 
@@ -709,17 +859,18 @@ _cs_patch_oauth_account_for_profile() {
     )
     return 0
   fi
-  echo "cs: warning — failed to patch ~/.claude.json oauthAccount (auth still uses env var)" >&2
+  echo "cs: warning — failed to patch $cfg oauthAccount (auth still uses profile config/env)" >&2
   return 0
 }
 
-# Undo a stale cosmetic patch. If ~/.claude.json still shows exactly what cs
+# Undo a stale cosmetic patch. If the active config still shows exactly what cs
 # last wrote, an unpinned launch would otherwise display the pinned profile's
-# identity while actually authenticating as the keychain account. Restore the
-# stashed keychain identity. If the user has /login'd since (oauthAccount no
+# identity while actually authenticating with the default config. Restore the
+# stashed default identity. If the user has /login'd since (oauthAccount no
 # longer matches our last patch), leave everything alone.
 _cs_restore_keychain_account() {
-  local cfg="$HOME/.claude.json" stash last cur
+  local cfg stash last cur
+  cfg="$(_cs_config_file)"
   stash="$(_cs_keychain_stash_file)"
   [[ -f "$stash" && -f "$cfg" && ! -L "$cfg" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
