@@ -110,7 +110,8 @@ _cs_keychain_service() {
 # Read the visible account email a profile is logged into, offline, from the
 # profile's own config. Echoes the email or "?" if unknown.
 _cs_profile_email() {
-  local cfg="$(_cs_profile_config_dir "$1")/.claude.json" email
+  local cfg email
+  cfg="$(_cs_profile_config_dir "$1")/.claude.json"
   [[ -f "$cfg" ]] || {
     printf '?'
     return 0
@@ -123,7 +124,8 @@ _cs_profile_email() {
 
 # True if a profile dir has a completed login (config with an oauthAccount).
 _cs_profile_is_set_up() {
-  local cfg="$(_cs_profile_config_dir "$1")/.claude.json"
+  local cfg
+  cfg="$(_cs_profile_config_dir "$1")/.claude.json"
   [[ -f "$cfg" ]] || return 1
   # Without jq we cannot confirm an oauthAccount was written, so treat the
   # profile as NOT set up rather than assuming success (a bare .claude.json is
@@ -200,13 +202,14 @@ _cs_use() {
 
   # Other overriding auth vars (API key, Bedrock/Vertex) belong to the user's
   # shell — don't silently unset them, but warn: the `claude` wrapper scrubs
-  # them at launch, and a bare `command claude` would NOT be isolated.
-  local v present=()
-  for v in "${_CS_AUTH_OVERRIDE_VARS[@]}"; do
-    [[ "$v" == CLAUDE_CODE_OAUTH_TOKEN ]] && continue
-    [[ -n "${(P)v:-}" ]] && present+=("$v")
-  done
-  ((${#present})) && echo "cs: note — $present is set; 'claude' will ignore it for this profile (bare 'command claude' would not)." >&2
+  # them at launch, and a bare `command claude` would NOT be isolated. Checked
+  # by name (not ${(P)…} indirection) so shfmt/shellcheck can parse this file.
+  local present=()
+  [[ -n "${ANTHROPIC_API_KEY:-}" ]] && present+=(ANTHROPIC_API_KEY)
+  [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]] && present+=(ANTHROPIC_AUTH_TOKEN)
+  [[ -n "${CLAUDE_CODE_USE_BEDROCK:-}" ]] && present+=(CLAUDE_CODE_USE_BEDROCK)
+  [[ -n "${CLAUDE_CODE_USE_VERTEX:-}" ]] && present+=(CLAUDE_CODE_USE_VERTEX)
+  ((${#present})) && echo "cs: note — ${present[*]} set; 'claude' will ignore it for this profile (bare 'command claude' would not)." >&2
 
   local email
   email="$(_cs_profile_email "$name")"
@@ -323,6 +326,9 @@ _cs_doctor() {
   local root f name marker email method found=0 bad=0
   local label json logged
   local -A email_slots
+  # Parallel list of emails in first-seen order, so the duplicate scan can
+  # iterate without the ${(@k)…} flag (which older shfmt/shellcheck can't parse).
+  local -a seen_order
   root="$(_cs_profiles_root)"
   # Scrub every overriding auth var so `auth status` reports the profile's real
   # keychain login, not a stray API key / Bedrock / Vertex identity.
@@ -372,6 +378,7 @@ _cs_doctor() {
     [[ -z "$email" ]] && email="?"
     echo "${marker}${label} — ${email} (${method})"
     [[ "$email" == "?" ]] && continue
+    [[ -z "${email_slots[$email]:-}" ]] && seen_order+=("$email")
     email_slots[$email]="${email_slots[$email]:+${email_slots[$email]}, }${label}"
   done
 
@@ -382,7 +389,7 @@ _cs_doctor() {
 
   # Report any account that shows up in more than one slot.
   local e dupes=0
-  for e in "${(@k)email_slots}"; do
+  for e in "${seen_order[@]}"; do
     if [[ "${email_slots[$e]}" == *", "* ]]; then
       dupes=1
       echo "" >&2
@@ -494,7 +501,9 @@ claude() {
   fi
   # Keep the exported config dir consistent with the pin (defends against a
   # shell where _CS_PROFILE and CLAUDE_CONFIG_DIR drifted apart).
-  export CLAUDE_CONFIG_DIR="$(_cs_profile_config_dir "$_CS_PROFILE")"
+  local cfg_dir
+  cfg_dir="$(_cs_profile_config_dir "$_CS_PROFILE")"
+  export CLAUDE_CONFIG_DIR="$cfg_dir"
   echo "cs: launching claude as '$_CS_PROFILE' ($(_cs_profile_email "$_CS_PROFILE"))" >&2
   # Launch with every overriding auth var stripped, so auth comes ONLY from the
   # profile's keychain slot — not a stray ANTHROPIC_API_KEY / OAuth token /

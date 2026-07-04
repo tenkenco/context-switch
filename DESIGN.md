@@ -60,7 +60,7 @@ Use a per-profile `CLAUDE_CONFIG_DIR` — and nothing else.
 Claude Code 2.x moved OAuth credentials into the OS keychain, but keyed each
 entry by a hash of the config dir:
 
-```
+```text
 service name = "Claude Code-credentials-" + sha256(CLAUDE_CONFIG_DIR)[0:8]
 ```
 
