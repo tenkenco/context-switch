@@ -28,28 +28,6 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 1
 fi
 
-# Soft warning: clipboard helpers are nice to have but not required (the pipe
-# path `claude setup-token | cs save <name>` works without one).
-have_clipboard=0
-for c in pbpaste wl-paste xclip xsel; do
-  if command -v "$c" >/dev/null 2>&1; then
-    have_clipboard=1
-    break
-  fi
-done
-if ((have_clipboard == 0)); then
-  echo "claude-switch: note — no clipboard helper found. The pipe path still works:"
-  echo "    claude setup-token | cs save personal"
-  echo "  To enable 'cs save personal' (no pipe) which reads from clipboard:"
-  case "$(uname -s)" in
-  Darwin) echo "    pbpaste/pbcopy ship with macOS — this should never trigger." ;;
-  Linux)
-    echo "    apt install xclip       # X11"
-    echo "    apt install wl-clipboard # Wayland"
-    ;;
-  esac
-fi
-
 if grep -Fq "$SOURCE_LINE" "$RC_FILE"; then
   echo "claude-switch: already installed in $RC_FILE — nothing to do."
   exit 0

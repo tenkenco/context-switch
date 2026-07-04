@@ -23,24 +23,24 @@ You log in here, log out there, and eventually lose track of which terminal is u
 ## How it works
 
 1. `cs login <name>` runs `claude auth login` with `CLAUDE_CONFIG_DIR` pointed at `~/.claude/profiles/<name>`.
-2. Claude Code stores that account's full `claude.ai` login state inside the profile config namespace.
-3. `cs use <name>` sets `CLAUDE_CONFIG_DIR` in the current shell only.
-4. The `claude` wrapper updates that profile config's `oauthAccount` so `/status` matches the pinned account.
+2. Claude Code 2.x stores that account's OAuth credentials in the OS keychain, in an entry keyed by a hash of `CLAUDE_CONFIG_DIR` (`Claude Code-credentials-<sha256(dir)[:8]>`). Each profile therefore gets its own isolated credential slot.
+3. `cs use <name>` exports that same `CLAUDE_CONFIG_DIR` in the current shell only.
+4. `claude` launches using the pinned profile's credentials — no rewriting, no env tokens.
 
-Legacy `cs save <name>` setup-token profiles are still supported as a fallback, but full Claude Code Max behavior should use `cs login`.
+### The one rule that matters
+
+**One account → one profile, and always `cs use` before `claude`.**
+
+Claude Code rotates OAuth refresh tokens: every refresh invalidates the previous refresh token. If the *same* account is logged into two credential slots — two profiles, or a profile **and** the unpinned default config — each refresh silently invalidates the other, and you get surprise `Please run /login` 401s. That is the single most common cause of "it made me log in again."
+
+Run `cs doctor` to catch it: it lists every namespace's account and flags any account that appears in more than one.
 
 ## Requirements
 
 - macOS or Linux
 - `zsh`
-- [Claude Code CLI](https://claude.com/claude-code)
+- [Claude Code CLI](https://claude.com/claude-code) (2.x)
 - `jq` (`brew install jq` on macOS, `apt install jq` on Debian/Ubuntu)
-- `curl` for save-time token verification and `cs doctor`
-- Optional clipboard tool for non-pipe saves:
-  - macOS: `pbpaste` / `pbcopy`
-  - Linux (X11): `xclip`
-  - Linux (Wayland): `wl-clipboard`
-  - Pipe mode always works: `claude setup-token | cs save name`
 
 ## Install
 
@@ -94,38 +94,34 @@ cs login work --claudeai --email you@work.com
 
 Each login opens Claude's normal browser OAuth flow once. After that, daily switching uses the saved isolated config.
 
-Legacy setup-token fallback:
-
-```sh
-claude setup-token | cs save personal
-```
-
-`cs save` verifies that the token is live and that the token's account matches the CLI login snapshot. If you intentionally want to save a token whose account cannot be checked or differs from the snapshot, add `--allow-mismatch`.
+> **Don't also log in unpinned.** If you run `claude` with no profile pinned, it logs into the *default* namespace. If that account also has a profile, the two will rotate each other's refresh tokens and force re-logins. Keep each account in exactly one profile.
 
 Done. 🎉
 
 ## Daily usage
 
 ```sh
-cs use work
+cs use work      # terminal A → work
 claude
 
-cs list
-cs current
-cs doctor
-cs off
-cs rm work
+cs use personal  # terminal B → personal
+claude
+
+cs list          # show profiles, * marks this shell's pin
+cs current       # what is this shell pinned to?
+cs doctor        # verify logins + catch duplicate-account slots
+cs off           # unpin this shell
+cs rm work       # delete a profile's config + keychain login
 ```
 
 ## Notes
 
-- ⚠️ Setup tokens are CI-style auth: inference works, but default model/MCP behavior can differ from full interactive login.
-- ✅ `cs login` profiles use Claude Code's full `claude.ai` login path in an isolated config directory.
-- 🩺 Run `cs doctor` to validate saved tokens and catch expired-token fallback or account mismatches.
+- ✅ `cs login` profiles use Claude Code's full `claude.ai` login in an isolated config directory (keychain-backed, per `CLAUDE_CONFIG_DIR`).
+- 🩺 `cs doctor` flags the real failure mode: one account in multiple namespaces (which causes surprise re-logins).
 - 🖥️ CLI-only: desktop app and IDE extensions do not inherit your shell's `CLAUDE_CONFIG_DIR`.
-- 🔐 `~/.claude/accounts/*.token` are bearer credentials. Protect them like API keys.
 - 🔐 `~/.claude/profiles/<name>` contains full Claude Code login state. Protect it like your normal Claude config.
-- 🧩 This tool depends on Claude Code internals, so future Claude releases may require updates.
+- 🔁 Two *concurrent* sessions of the **same** profile share one credential slot; heavy parallel use of one account can still rotate against itself.
+- 🧩 This tool depends on Claude Code internals, so future Claude releases may require updates. Re-check with `cs doctor` after upgrades.
 
 ## Tests
 
@@ -133,7 +129,7 @@ cs rm work
 ./tests/smoke.zsh
 ```
 
-Covers profile validation, login/use/off/list/current/rm/doctor flows, save-time token verification, isolated profile config behavior, wrapper behavior, and security checks.
+Covers profile validation, login/use/off/list/current/rm/doctor flows, isolated config behavior, duplicate-account detection, wrapper behavior, and path-traversal guards.
 CI runs this suite on both macOS and Ubuntu in `.github/workflows/test.yml`.
 
 ## Design notes

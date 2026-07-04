@@ -53,48 +53,49 @@ When this is set, Claude follows the env-var token path instead of the keychain 
 
 The tokens also are long-lived, so there's no need to re-login every time.
 
-## What works now
+## What works now (Claude Code 2.x)
 
-Use a per-profile `CLAUDE_CONFIG_DIR`.
+Use a per-profile `CLAUDE_CONFIG_DIR` — and nothing else.
 
-Claude Code now treats setup tokens more like CI/inference auth. They still work
-for API calls, but they do not reliably provide the full Claude Code Max
-subscription behavior that the interactive app expects. A full `claude.ai`
-login is still needed for that.
+Claude Code 2.x moved OAuth credentials into the OS keychain, but keyed each
+entry by a hash of the config dir:
 
-`cs login <name>` runs `claude auth login` with:
-
-```sh
-CLAUDE_CONFIG_DIR="$HOME/.claude/profiles/<name>"
+```
+service name = "Claude Code-credentials-" + sha256(CLAUDE_CONFIG_DIR)[0:8]
 ```
 
-That stores the profile's full Claude Code auth/config state in a private
-directory. `cs use <name>` exports the same `CLAUDE_CONFIG_DIR` in the current
-shell before launching Claude. Setup tokens remain as a fallback for older
-profiles that have not been migrated.
-
-## Why `claude setup-token` is part of the flow
-
-The env-var path expects long-lived tokens, so `claude setup-token` is the practical source for the legacy fallback. It's just a one-time setup to get the token every time I want to use a different account.
-
-Tradeoff:
-
-- inference isolation is reliable
-- token-based auth can behave a little differently from normal login mode (default model selection, how `/status` displays identity, and MCP servers sometimes needing re-auth or showing different workspace context)
-
-## Why we still patch `oauthAccount`
-
-Even when auth comes from the profile config or `CLAUDE_CODE_OAUTH_TOKEN`,
-`/status` display still reads from `oauthAccount`.
-To keep the visible identity aligned with the selected account, the wrapper updates the active profile config's `oauthAccount` before launch.
-
-That patch is cosmetic; authentication comes from the isolated profile config or, for legacy profiles, the env-var token.
+So the keychain no longer has one shared blob that launch-time swapping fought
+over — each `CLAUDE_CONFIG_DIR` gets its own credential slot. Pointing each
+shell at its own profile dir gives true, durable credential isolation with no
+interception layer at all:
 
 ```sh
-cs login <name> # one-time full login into ~/.claude/profiles/<name>
-cs use <name>   # exports CLAUDE_CONFIG_DIR for this shell
-claude          # patches profile oauthAccount for display, then runs real claude
+cs login <name>   # one-time: claude auth login with CLAUDE_CONFIG_DIR=~/.claude/profiles/<name>
+cs use <name>      # exports that CLAUDE_CONFIG_DIR for this shell
+claude             # launches using the profile's keychain slot
 ```
+
+The setup-token / `CLAUDE_CODE_OAUTH_TOKEN` path and the `oauthAccount` patch
+were removed: config-dir hashing makes them unnecessary, and each carried its
+own failure modes (CI-tier auth, expired tokens silently falling back to the
+keychain, cosmetic patches drifting from real logins). `/status` already reads
+correctly from each profile's own `.claude.json`, written by its login.
+
+## The failure mode that remains: refresh-token rotation
+
+Config-dir hashing isolates credential *storage*, but it does **not** isolate an
+account's refresh-token lineage. Claude Code uses rotating OAuth refresh tokens:
+each refresh issues a new refresh token and invalidates the previous one.
+
+If the *same* account is logged into two credential slots — two profiles, or a
+profile plus the unpinned default namespace — then whichever slot refreshes last
+invalidates the other. The next time you use the stale slot, refresh fails with
+a 401 and Claude Code asks you to `/login`. This looks exactly like "switching
+broke my other account."
+
+The fix is a usage rule, not code: **one account, one profile; always `cs use`
+before `claude`.** `cs doctor` enforces it by reporting the account behind every
+namespace (including the default) and failing if any account appears twice.
 
 ## Out of scope
 
@@ -105,35 +106,28 @@ Those options add moving parts and maintenance burden without improving the core
 
 ## Platform support
 
-The core mechanism (`CLAUDE_CONFIG_DIR`, optional env-var auth fallback,
-`oauthAccount` snapshot, and profile config patching) is platform-agnostic. The only macOS/Linux differences today are shell utilities:
+The whole mechanism is now just `CLAUDE_CONFIG_DIR` plus a `sha256` for the
+keychain-service name (used by `cs rm`/`cs doctor`), so there is almost nothing
+platform-specific left. `shasum` ships on macOS and most Linux; `sha256sum` is
+the Linux fallback. Keychain deletion in `cs rm` uses `security` on macOS and is
+skipped elsewhere (removing the profile dir is still enough to switch away).
 
-| Concern | macOS | Linux |
-| ------- | ----- | ----- |
-| Clipboard helper | `pbpaste` / `pbcopy` | `wl-paste` / `wl-copy` (Wayland), `xclip` or `xsel` (X11) |
-| File-mode read | `stat -f '%Lp'` (BSD) | `stat -c '%a'` (GNU) |
-
-These are abstracted at source time:
-
-```zsh
-typeset -g _CS_PASTE_CMD _CS_COPY_CMD   # detected once when cs.zsh is sourced
-_cs_have_clipboard / _cs_paste / _cs_copy / _cs_stat_mode   # only platform-aware helpers
-```
-
-Supporting additional Unix-like platforms (for example, BSD variants) should only require extending detection and possibly `_cs_stat_mode`. The config isolation, optional env-var auth fallback, and JSON patch strategy stay the same.
-
-Native Windows is not currently supported because token storage behavior there has not been characterized. WSL follows the Linux path.
+Native Windows is not supported because keychain behavior there has not been
+characterized. WSL follows the Linux path.
 
 ## Re-validate on new Claude versions
 
 If Claude internals change, quickly re-check the assumptions:
 
 ```sh
-strings "$(realpath "$(command -v claude)")" | grep -F "Claude Code-credentials"
-jq '.oauthAccount | keys' ~/.claude.json
-tmp="$(mktemp -d)"
-CLAUDE_CONFIG_DIR="$tmp" claude auth status --json
-CLAUDE_CODE_OAUTH_TOKEN="<token>" CLAUDE_CONFIG_DIR="$tmp" claude -p "say pong"
+# 1. Are credentials still keyed by sha256(CLAUDE_CONFIG_DIR)?
+security dump-keychain 2>/dev/null | grep -o '"Claude Code-credentials[^"]*"' | sort -u
+printf '%s' "$HOME/.claude/profiles/personal" | shasum -a 256 | cut -c1-8   # expect a matching suffix
+
+# 2. Does each isolated config resolve to its own account?
+CLAUDE_CONFIG_DIR="$HOME/.claude/profiles/personal" claude auth status --json
+CLAUDE_CONFIG_DIR="$HOME/.claude/profiles/work"     claude auth status --json
 ```
 
-If any of these assumptions drift, `claude-switch` may need an update.
+If the suffix no longer matches, or two config dirs collapse to one account,
+`claude-switch` (and `cs doctor`) may need an update.

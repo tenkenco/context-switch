@@ -1,8 +1,8 @@
 #!/usr/bin/env zsh
 # claude-switch smoke tests.
 # Runs in a sandboxed $HOME with a fake claude binary on PATH so no real
-# Claude Code state is touched. Every test is independent — setup creates a
-# fresh sandbox, teardown deletes it.
+# Claude Code state or keychain is touched. Every test is independent — setup
+# creates a fresh sandbox, teardown deletes it.
 #
 # Usage:   ./tests/smoke.zsh
 # Exit 0 on all pass, 1 on any failure.
@@ -24,7 +24,6 @@ typeset -a FAILED
 
 #------------------------------------------------------------------- helpers
 
-# Emit failure with context. Each assertion appends to PASS / FAIL.
 _pass() {
   PASS=$((PASS + 1))
   echo "  ok  $1"
@@ -74,176 +73,83 @@ assert_file_absent() {
   [[ ! -e "$file" ]] && _pass "$desc" || _fail "$desc" "should not exist: $file"
 }
 
-assert_file_mode() {
-  local desc="$1" file="$2" expected="$3"
-  local actual
-  actual="$(_cs_stat_mode "$file" 2>/dev/null)"
-  if [[ "$actual" == "$expected" ]]; then
-    _pass "$desc"
-  else
-    _fail "$desc" "expected mode $expected, got $actual on $file"
-  fi
-}
-
-assert_returns() {
-  local desc="$1" expected_rc="$2"
-  shift 2
-  "$@" >/dev/null 2>&1
-  local rc=$?
-  if ((rc == expected_rc)); then
-    _pass "$desc"
-  else
-    _fail "$desc" "expected rc=$expected_rc, got $rc"
-  fi
+assert_dir_absent() {
+  local desc="$1" dir="$2"
+  [[ ! -e "$dir" ]] && _pass "$desc" || _fail "$desc" "should not exist: $dir"
 }
 
 #------------------------------------------------------------------- sandbox
 
+# Fake claude binary. Behaviors:
+#   auth login   -> writes a profile .claude.json with an oauthAccount whose
+#                   email comes from --email (or a default), echoes its argv,
+#                   and records whether CLAUDE_CODE_OAUTH_TOKEN leaked in.
+#   auth status  -> emits {loggedIn,...} JSON reflecting the config dir's
+#                   .claude.json (loggedIn:false when none).
+#   anything else-> echoes FAKE_CLAUDE: <argv>.
 setup() {
   SANDBOX="$(mktemp -d -t cs-test.XXXXXX)"
   export HOME="$SANDBOX"
   mkdir -p "$HOME/.claude"
-  # Plausible ~/.claude.json with an oauthAccount and one unrelated key
-  # so we can verify the wrapper preserves other keys.
-  cat >"$HOME/.claude.json" <<'JSON'
-{
-  "oauthAccount": {
-    "emailAddress": "before@example.com",
-    "organizationRateLimitTier": "default_test_tier",
-    "organizationUuid": "org-home",
-    "accountUuid": "00000000-0000-0000-0000-000000000000"
-  },
-  "unrelatedKey": "must_be_preserved"
-}
-JSON
-  # Fake claude binary that prints its argv so we can detect invocations.
-  # Also fake pbpaste / pbcopy so clipboard branches are testable.
   mkdir -p "$SANDBOX/bin"
   cat >"$SANDBOX/bin/claude" <<'SH'
 #!/bin/sh
 if [ "$1" = "auth" ] && [ "$2" = "login" ]; then
   [ -n "${CLAUDE_CODE_OAUTH_TOKEN-}" ] && printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" >"${HOME}/.auth-login-token-env"
+  all="$*"
+  email="login@example.com"
+  while [ $# -gt 0 ]; do
+    [ "$1" = "--email" ] && { email="$2"; shift; }
+    shift
+  done
   mkdir -p "$CLAUDE_CONFIG_DIR"
   cat >"$CLAUDE_CONFIG_DIR/.claude.json" <<JSON
-{"oauthAccount":{"emailAddress":"login@example.com","organizationRateLimitTier":"tier_login","organizationUuid":"org-login","accountUuid":"uuid-login"}}
+{"oauthAccount":{"emailAddress":"$email","organizationUuid":"org-$email"}}
 JSON
-  printf 'FAKE_CLAUDE_AUTH_LOGIN: %s\n' "$*"
+  printf 'FAKE_CLAUDE_AUTH_LOGIN: %s\n' "$all"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.claude.json"
+  if [ -f "$cfg" ]; then
+    email=$(sed -n 's/.*"emailAddress":"\([^"]*\)".*/\1/p' "$cfg")
+    printf '{"loggedIn":true,"authMethod":"claude.ai","email":"%s","subscriptionType":"max"}\n' "$email"
+  else
+    printf '{"loggedIn":false}\n'
+  fi
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "logout" ]; then
+  rm -f "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.claude.json"
+  printf 'FAKE_CLAUDE_LOGOUT\n'
   exit 0
 fi
 printf 'FAKE_CLAUDE: %s\n' "$*"
 SH
-  cat >"$SANDBOX/bin/pbpaste" <<'SH'
-#!/bin/sh
-printf '%s' "${TEST_CLIPBOARD-}"
-SH
-  cat >"$SANDBOX/bin/pbcopy" <<SH
-#!/bin/sh
-cat > "$SANDBOX/.pbcopy.last"
-SH
-  chmod +x "$SANDBOX/bin/"*
+  chmod +x "$SANDBOX/bin/claude"
   export PATH="$SANDBOX/bin:$PATH"
-  # cs save now verifies tokens over the network, so every test needs the
-  # fake curl, not just doctor's.
-  stub_curl
-  # Reset shell state and source under test
-  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE _CS_TOKEN_SOURCE TEST_CLIPBOARD 2>/dev/null
-  unfunction cs claude _cs_validate_name _cs_stat_mode _cs_paste _cs_copy \
-    _cs_have_clipboard _cs_oauth_account_json _cs_read_token \
-    _cs_profile_config_dir _cs_profile_login_marker _cs_config_file _cs_profile_has_full_login \
-    _cs_save _cs_use _cs_off _cs_list _cs_check_token _cs_doctor \
-    _cs_current _cs_rm _cs_login _cs_help _cs_profile_account_file _cs_profile_email \
-    _cs_keychain_stash_file _cs_last_patch_file _cs_write_oauth_account \
-    _cs_patch_oauth_account_for_profile _cs_restore_keychain_account 2>/dev/null
+
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE 2>/dev/null
+  unfunction cs claude _cs_validate_name _cs_profiles_root _cs_profile_config_dir \
+    _cs_sha256_8 _cs_keychain_service _cs_profile_email _cs_profile_is_set_up \
+    _cs_login _cs_use _cs_off _cs_list _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
   source "$CS_ZSH"
-  # Override platform detection: cs.zsh probed PATH at source-time. With our
-  # stubs first on PATH, it should have picked pbpaste/pbcopy — but reseat
-  # explicitly in case the host runner has wl-paste/xclip ahead of pbpaste.
-  _CS_PASTE_CMD="pbpaste"
-  _CS_COPY_CMD="pbcopy"
 }
 
 teardown() {
   [[ -n "${SANDBOX:-}" && -d "$SANDBOX" ]] && rm -rf "$SANDBOX"
-  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE TEST_CLIPBOARD SANDBOX 2>/dev/null
-  # Restore PATH (best effort — only matters if the runner reuses this shell)
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE SANDBOX 2>/dev/null
   PATH="${PATH#*:}"
 }
 
-# Helper: write a fully-formed profile (token + account snapshot) bypassing cs save.
-# Snapshot org defaults to org-home, matching what the stub curl reports for
-# ordinary tokens, so seeded profiles are identity-consistent by default.
+# Create a logged-in profile directly (no claude invocation).
 seed_profile() {
-  local name="$1" token="${2:-sk-ant-oat01-FAKE-TOKEN-FOR-TESTS}" org="org-home"
-  (($# >= 3)) && org="$3"
-  mkdir -p "$HOME/.claude/accounts"
-  printf '%s' "$token" >"$HOME/.claude/accounts/$name.token"
-  cat >"$HOME/.claude/accounts/$name.account.json" <<JSON
-{"emailAddress":"$name@example.com","organizationRateLimitTier":"tier_$name","organizationUuid":"$org","accountUuid":"uuid-$name"}
-JSON
-  chmod 600 "$HOME/.claude/accounts/$name.token" "$HOME/.claude/accounts/$name.account.json"
-}
-
-seed_full_login_profile() {
-  local name="$1" email="${2:-$1@example.com}" tier="${3:-tier_$name}" org="${4:-org-$name}"
+  local name="$1" email="${2:-$1@example.com}"
   local cfg_dir="$HOME/.claude/profiles/$name"
-  mkdir -p "$cfg_dir" "$HOME/.claude/accounts"
+  mkdir -p "$cfg_dir"
   cat >"$cfg_dir/.claude.json" <<JSON
-{"oauthAccount":{"emailAddress":"$email","organizationRateLimitTier":"$tier","organizationUuid":"$org","accountUuid":"uuid-$name"}}
+{"oauthAccount":{"emailAddress":"$email","organizationUuid":"org-$name"}}
 JSON
-  cat >"$HOME/.claude/accounts/$name.account.json" <<JSON
-{"emailAddress":"$email","organizationRateLimitTier":"$tier","organizationUuid":"$org","accountUuid":"uuid-$name"}
-JSON
-  printf '1\n' >"$cfg_dir/.cs-full-login"
-  chmod 600 "$cfg_dir/.claude.json" "$cfg_dir/.cs-full-login" "$HOME/.claude/accounts/$name.account.json"
-}
-
-# Install a fake curl that emulates the API. The bearer token arrives via the
-# stdin config (`-K -`, keeping it out of argv like the real invocation), so
-# the stub inspects argv AND the stdin config for markers: tokens containing
-# "EXPIRED" -> 401, "FORBIDDEN" -> 403, "DOWN" -> 000 (unreachable), otherwise
-# 200. Tokens containing "OTHERORG" report organization id "org-elsewhere";
-# tokens containing "NOORG" omit the org header; everything else reports
-# "org-home". Honors the real invocation's contract: `-w '%{http_code}'` code
-# on stdout, `-D <file>` response headers.
-stub_curl() {
-  cat >"$SANDBOX/bin/curl" <<'SH'
-#!/bin/sh
-hdr=""
-prev=""
-code="200"
-org="org-home"
-stdin_cfg=0
-for a in "$@"; do
-  [ "$prev" = "-D" ] && hdr="$a"
-  [ "$prev" = "-K" ] && [ "$a" = "-" ] && stdin_cfg=1
-  # Regression guard: the token must NEVER appear in argv (world-readable via
-  # /proc/<pid>/cmdline on Linux). Fail hard so every token test breaks.
-  case "$a" in
-    *sk-ant-oat*) printf '999'; exit 0 ;;
-  esac
-  prev="$a"
-done
-haystack="$*"
-[ "$stdin_cfg" = "1" ] && haystack="$haystack $(cat)"
-case "$haystack" in
-  *EXPIRED*)          code="401" ;;
-  *FORBIDDEN*)        code="403" ;;
-  *QUOTE\"-TOKEN*)    code="998" ;;
-  *DOWN*)             code="000" ;;
-esac
-case "$haystack" in
-  *OTHERORG*) org="org-elsewhere" ;;
-  *NOORG*)    org="" ;;
-esac
-if [ -n "$hdr" ] && [ "$code" != "000" ]; then
-  printf 'HTTP/2 %s\r\n' "$code" >"$hdr"
-fi
-if [ -n "$hdr" ] && [ "$code" != "000" ] && [ -n "$org" ]; then
-  printf 'HTTP/2 %s\r\nanthropic-organization-id: %s\r\n\r\n' "$code" "$org" >"$hdr"
-fi
-printf '%s' "$code"
-SH
-  chmod +x "$SANDBOX/bin/curl"
 }
 
 #------------------------------------------------------------------- tests
@@ -253,19 +159,11 @@ t_validate_name() {
   setup
   local n
   for n in a abc a1 a_b a-b a.b a_-.b XyZ123 long-name_with.dots; do
-    if _cs_validate_name "$n"; then
-      _pass "valid: $n"
-    else
-      _fail "valid: $n" "should accept"
-    fi
+    if _cs_validate_name "$n"; then _pass "valid: $n"; else _fail "valid: $n" "should accept"; fi
   done
   local bad
   for bad in "" "." ".foo" "-foo" "foo/bar" "../foo" "foo..bar" "a;b" "a b" "/abs" "a/b"; do
-    if _cs_validate_name "$bad"; then
-      _fail "invalid: ${bad:-<empty>}" "should reject"
-    else
-      _pass "invalid: ${bad:-<empty>}"
-    fi
+    if _cs_validate_name "$bad"; then _fail "invalid: ${bad:-<empty>}" "should reject"; else _pass "invalid: ${bad:-<empty>}"; fi
   done
   teardown
 }
@@ -274,367 +172,88 @@ t_help() {
   echo "[help]"
   setup
   local out
-  out="$(cs help 2>&1)"
-  assert_contains "cs help mentions Usage" "$out" "Usage:"
-  out="$(cs --help 2>&1)"
-  assert_contains "cs --help works" "$out" "Usage:"
-  out="$(cs -h 2>&1)"
-  assert_contains "cs -h works" "$out" "Usage:"
-  out="$(cs 2>&1)"
-  assert_contains "cs (no args) shows help" "$out" "Usage:"
-  out="$(cs unknown 2>&1)"
-  assert_contains "unknown subcommand error" "$out" "unknown subcommand"
+  out="$(cs help 2>&1)"; assert_contains "cs help mentions Usage" "$out" "Usage:"
+  out="$(cs --help 2>&1)"; assert_contains "cs --help works" "$out" "Usage:"
+  out="$(cs -h 2>&1)"; assert_contains "cs -h works" "$out" "Usage:"
+  out="$(cs 2>&1)"; assert_contains "cs (no args) shows help" "$out" "Usage:"
+  out="$(cs unknown 2>&1)"; assert_contains "unknown subcommand error" "$out" "unknown subcommand"
   teardown
 }
 
-t_save_invalid_name() {
-  echo "[save: invalid name rejected]"
+t_sha256_matches_claude_scheme() {
+  echo "[keychain: service name = sha256(config dir)[:8]]"
   setup
-  local n out
-  for n in "../escape" "/tmp/escape" "..hidden" "evil; rm -rf /" "a/b" "" ".dot"; do
-    out="$(printf 'sk-ant-oat01-x' | cs save "$n" 2>&1)"
-    if [[ -z "$n" ]]; then
-      assert_contains "save '<empty>' shows usage" "$out" "cs save"
-    else
-      assert_contains "save '$n' rejected" "$out" "invalid profile name"
-    fi
-    assert_file_absent "no token file leaked for '$n'" "$HOME/.claude/accounts/$n.token"
-  done
-  # Path-traversal target outside accounts dir must also not exist
-  assert_file_absent "no traversal escape file" "$HOME/.claude/escape.token"
-  teardown
-}
-
-t_save_happy_path_stdin() {
-  echo "[save: happy path via stdin]"
-  setup
-  local out
-  out="$(printf 'sk-ant-oat01-VALID-TEST-TOKEN' | cs save personal 2>&1)"
-  assert_contains "save success message" "$out" "saved profile 'personal'"
-  assert_contains "save shows email" "$out" "before@example.com"
-  assert_file_exists "token file written" "$HOME/.claude/accounts/personal.token"
-  assert_file_exists "account snapshot written" "$HOME/.claude/accounts/personal.account.json"
-  assert_file_mode "token file mode 600" "$HOME/.claude/accounts/personal.token" "600"
-  assert_file_mode "account file mode 600" "$HOME/.claude/accounts/personal.account.json" "600"
-  local saved
-  saved="$(cat "$HOME/.claude/accounts/personal.token")"
-  assert_eq "token saved verbatim" "$saved" "sk-ant-oat01-VALID-TEST-TOKEN"
-  teardown
-}
-
-t_save_strips_whitespace() {
-  echo "[save: whitespace stripped]"
-  setup
-  printf '  sk-ant-oat01-WITH-WHITESPACE  \n\n' | cs save personal >/dev/null 2>&1
-  local saved
-  saved="$(cat "$HOME/.claude/accounts/personal.token")"
-  assert_eq "leading/trailing whitespace stripped" "$saved" "sk-ant-oat01-WITH-WHITESPACE"
-  teardown
-}
-
-t_save_force_required_to_overwrite() {
-  echo "[save: --force required to overwrite]"
-  setup
-  printf 'sk-ant-oat01-A' | cs save personal >/dev/null 2>&1
-  local out
-  out="$(printf 'sk-ant-oat01-B' | cs save personal 2>&1)"
-  assert_contains "second save without --force refuses" "$out" "Pass --force"
-  local saved
-  saved="$(cat "$HOME/.claude/accounts/personal.token")"
-  assert_eq "original token preserved on refuse" "$saved" "sk-ant-oat01-A"
-  out="$(printf 'sk-ant-oat01-B' | cs save personal --force 2>&1)"
-  assert_contains "second save with --force succeeds" "$out" "saved profile 'personal'"
-  saved="$(cat "$HOME/.claude/accounts/personal.token")"
-  assert_eq "token replaced with --force" "$saved" "sk-ant-oat01-B"
-  teardown
-}
-
-t_save_empty_token_rejected() {
-  echo "[save: empty token rejected]"
-  setup
-  local out
-  out="$(printf '' | cs save personal 2>&1)"
-  assert_contains "empty token rejected" "$out" "empty token"
-  assert_file_absent "no token file written" "$HOME/.claude/accounts/personal.token"
-  teardown
-}
-
-t_save_bad_prefix_rejected_no_leak() {
-  echo "[save: bad prefix rejected, no token leak]"
-  setup
-  local secret="aws-secret-key-AKIAEXAMPLE_SECRET_NEVER_LEAK"
-  local out
-  out="$(printf '%s' "$secret" | cs save personal 2>&1)"
-  assert_contains "bad prefix rejected" "$out" "doesn't look like a Claude setup-token"
-  assert_not_contains "first 20 chars NOT printed" "$out" "aws-secret-key-AKIAE"
-  assert_not_contains "no length info leaked" "$out" "length"
-  assert_file_absent "no token file written" "$HOME/.claude/accounts/personal.token"
-  teardown
-}
-
-t_save_token_flag_warning() {
-  echo "[save: --token flag warns about history]"
-  setup
-  local out
-  out="$(cs save personal --token sk-ant-oat01-VIA-FLAG 2>&1)"
-  assert_contains "--token flag warning emitted" "$out" "shell history"
-  assert_contains "save still succeeds" "$out" "saved profile"
-  teardown
-}
-
-t_save_missing_user_cfg() {
-  echo "[save: missing ~/.claude.json]"
-  setup
-  rm -f "$HOME/.claude.json"
-  local out
-  out="$(printf 'sk-ant-oat01-x' | cs save personal 2>&1)"
-  assert_contains "missing user_cfg detected" "$out" ".claude.json missing"
-  assert_file_absent "no token file written" "$HOME/.claude/accounts/personal.token"
-  teardown
-}
-
-t_save_missing_oauth_account() {
-  echo "[save: ~/.claude.json without oauthAccount]"
-  setup
-  echo '{"unrelated":"x"}' >"$HOME/.claude.json"
-  local out
-  out="$(printf 'sk-ant-oat01-x' | cs save personal 2>&1)"
-  assert_contains "missing oauthAccount detected" "$out" "no .oauthAccount"
-  teardown
-}
-
-t_save_umask_not_leaked() {
-  echo "[save: umask preserved across function call]"
-  setup
-  umask 022
-  local before after
-  before="$(umask)"
-  printf 'sk-ant-oat01-x' | cs save personal >/dev/null 2>&1
-  after="$(umask)"
-  assert_eq "umask unchanged after cs save" "$after" "$before"
-  teardown
-}
-
-t_save_unknown_flag() {
-  echo "[save: unknown flag rejected]"
-  setup
-  local out
-  out="$(cs save personal --bogus 2>&1)"
-  assert_contains "unknown flag error" "$out" "unknown flag '--bogus'"
-  teardown
-}
-
-t_save_too_many_args() {
-  echo "[save: too many positional args]"
-  setup
-  local out
-  out="$(cs save personal extra 2>&1)"
-  assert_contains "too many args error" "$out" "too many args"
-  teardown
-}
-
-t_save_stdin_flag_explicit() {
-  echo "[save: --stdin flag explicit]"
-  setup
-  local out
-  out="$(printf 'sk-ant-oat01-via-explicit-stdin' | cs save personal --stdin 2>&1)"
-  assert_contains "explicit --stdin succeeds" "$out" "saved profile 'personal'"
-  local saved
-  saved="$(<"$HOME/.claude/accounts/personal.token")"
-  assert_eq "explicit --stdin token saved" "$saved" "sk-ant-oat01-via-explicit-stdin"
-  teardown
-}
-
-t_save_no_input_method() {
-  echo "[save: no input method available]"
-  setup
-  # Force "no clipboard" by clearing the detected commands.
-  _CS_PASTE_CMD="" _CS_COPY_CMD=""
-  rm -f "$SANDBOX/bin/pbpaste" "$SANDBOX/bin/pbcopy"
-  hash -r
-  local out rc
-  # stdin from /dev/null makes [[ ! -t 0 ]] true so it falls through to stdin
-  # path and gets empty input. We just want to confirm graceful failure.
-  out="$(cs save personal </dev/null 2>&1)"
-  rc=$?
-  assert_eq "save with no real input fails cleanly" "$rc" "1"
-  teardown
-}
-
-t_save_no_clipboard_no_stdin() {
-  echo "[save: --clipboard requested but no clipboard tool detected]"
-  setup
-  _CS_PASTE_CMD="" _CS_COPY_CMD=""
-  rm -f "$SANDBOX/bin/pbpaste" "$SANDBOX/bin/pbcopy"
-  hash -r
-  local out
-  out="$(cs save personal --clipboard 2>&1 </dev/null)"
-  assert_contains "no-clipboard error mentions all known tools" "$out" "no clipboard tool found"
-  teardown
-}
-
-t_clipboard_helpers_route_through_indirection() {
-  echo "[clipboard: helpers respect _CS_PASTE_CMD / _CS_COPY_CMD]"
-  setup
-  # Repoint paste/copy at our stubs explicitly, even if detection chose differently.
-  _CS_PASTE_CMD="pbpaste"
-  _CS_COPY_CMD="pbcopy"
-  export TEST_CLIPBOARD="hello-from-test-clipboard"
+  # Known vector: sha256("/tmp/x") first 8 hex.
+  local expect
+  expect="$(printf '%s' "/tmp/x" | shasum -a 256 | cut -c1-8)"
   local got
-  got="$(_cs_paste)"
-  assert_eq "_cs_paste returns clipboard content" "$got" "hello-from-test-clipboard"
-  echo "written-via-helper" | _cs_copy
-  local sent
-  sent="$(<"$SANDBOX/.pbcopy.last")"
-  assert_eq "_cs_copy writes through to clipboard tool" "$sent" "written-via-helper"
+  got="$(_cs_sha256_8 "/tmp/x")"
+  assert_eq "_cs_sha256_8 matches shasum" "$got" "$expect"
+  local svc
+  svc="$(_cs_keychain_service "/tmp/x")"
+  assert_eq "service name is well-formed" "$svc" "Claude Code-credentials-$expect"
   teardown
 }
 
-t_stat_mode_helper() {
-  echo "[stat: _cs_stat_mode returns numeric mode]"
+t_login_isolated_no_token_leak() {
+  echo "[login: isolated, no token leak, writes profile config]"
   setup
-  local f="$SANDBOX/.modetest"
-  touch "$f"
-  chmod 644 "$f"
-  local m
-  m="$(_cs_stat_mode "$f")"
-  assert_eq "_cs_stat_mode reports 644" "$m" "644"
-  chmod 600 "$f"
-  m="$(_cs_stat_mode "$f")"
-  assert_eq "_cs_stat_mode reports 600" "$m" "600"
-  teardown
-}
-
-t_save_clipboard_clears_after_use() {
-  echo "[save: clipboard cleared after successful clipboard-source save]"
-  setup
-  export TEST_CLIPBOARD="sk-ant-oat01-FROM-CLIPBOARD"
-  # Need to feed Enter past the "press Enter to confirm" prompt and force clipboard
-  echo "" | cs save personal --clipboard >/dev/null 2>&1
-  # Our fake pbcopy writes to $SANDBOX/.pbcopy.last; if cleared, file is empty
-  if [[ -f "$SANDBOX/.pbcopy.last" ]]; then
-    local sz
-    sz="$(wc -c <"$SANDBOX/.pbcopy.last" | tr -d ' ')"
-    assert_eq "pbcopy was called with empty input" "$sz" "0"
-  else
-    _fail "pbcopy was called after clipboard-source save" "expected $SANDBOX/.pbcopy.last to exist"
-  fi
-  teardown
-}
-
-t_use_invalid_name() {
-  echo "[use: invalid name rejected]"
-  setup
+  export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-SHOULD-NOT-LEAK"
   local out
-  out="$(cs use ../foo 2>&1)"
-  assert_contains "use '../foo' rejected" "$out" "invalid profile name"
-  out="$(cs use 2>&1)"
-  assert_contains "use no-arg shows usage" "$out" "cs use"
+  out="$(cs login work --claudeai --email work@corp.com 2>&1)"
+  assert_contains "invokes claude auth login" "$out" "FAKE_CLAUDE_AUTH_LOGIN: auth login --claudeai"
+  assert_file_absent "auth login did NOT inherit token env" "$HOME/.auth-login-token-env"
+  assert_file_exists "profile config written" "$HOME/.claude/profiles/work/.claude.json"
+  assert_contains "success reports email" "$out" "work@corp.com"
   teardown
 }
 
-t_use_missing_files() {
-  echo "[use: missing profile reports cleanly]"
+t_login_default_args_prefill_email() {
+  echo "[login: re-login pre-fills last email]"
   setup
+  seed_profile work work@corp.com
   local out
-  out="$(cs use ghost 2>&1)"
-  assert_contains "missing profile detected" "$out" "not set up"
+  out="$(cs login work 2>&1)"
+  assert_contains "defaults to --claudeai" "$out" "auth login --claudeai"
+  assert_contains "pre-fills previous email" "$out" "--email work@corp.com"
   teardown
 }
 
-t_use_happy_path() {
-  echo "[use: legacy token path exports token and config dir]"
+t_use_sets_env_no_token() {
+  echo "[use: exports config dir + profile, never a token]"
   setup
   seed_profile personal
-  # IMPORTANT: cannot use `out=$(cs use ...)` — that runs cs use in a subshell,
-  # so any env exports / shell-var assignments are lost on subshell exit.
-  # Redirect stdout/stderr to a file instead so the function executes in this
-  # shell and we can still inspect its output.
-  cs use personal >|"$SANDBOX/.use.out" 2>&1
-  local out
-  out="$(<"$SANDBOX/.use.out")"
-  assert_contains "use prints email" "$out" "personal@example.com"
+  export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-STALE"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out; out="$(<"$SANDBOX/.out")"
+  assert_contains "reports pin + email" "$out" "personal@example.com"
   assert_eq "_CS_PROFILE set" "${_CS_PROFILE:-}" "personal"
   assert_eq "CLAUDE_CONFIG_DIR exported" "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude/profiles/personal"
-  assert_eq "CLAUDE_CODE_OAUTH_TOKEN exported" "${CLAUDE_CODE_OAUTH_TOKEN:-}" "sk-ant-oat01-FAKE-TOKEN-FOR-TESTS"
-  zsh -c '[[ "$_CS_PROFILE" == "personal" && "$CLAUDE_CONFIG_DIR" == "$HOME/.claude/profiles/personal" && "$CLAUDE_CODE_OAUTH_TOKEN" == "sk-ant-oat01-FAKE-TOKEN-FOR-TESTS" ]]'
-  assert_eq "profile env exported for child shells" "$?" "0"
+  assert_eq "stale token cleared" "${CLAUDE_CODE_OAUTH_TOKEN:-_NONE_}" "_NONE_"
+  zsh -c '[[ "$_CS_PROFILE" == "personal" && "$CLAUDE_CONFIG_DIR" == "$HOME/.claude/profiles/personal" ]]'
+  assert_eq "env exported for child shells" "$?" "0"
   teardown
 }
 
-t_use_full_login_prefers_config() {
-  echo "[use: full login path does not export setup token]"
+t_use_invalid_and_missing() {
+  echo "[use: invalid + missing handled]"
   setup
-  seed_profile work
-  seed_full_login_profile work work@example.com tier_work org-work
-  cs use work >|"$SANDBOX/.use.out" 2>&1
   local out
-  out="$(<"$SANDBOX/.use.out")"
-  assert_contains "use reports isolated login" "$out" "isolated claude.ai login"
-  assert_eq "_CS_PROFILE set" "${_CS_PROFILE:-}" "work"
-  assert_eq "CLAUDE_CONFIG_DIR exported" "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude/profiles/work"
-  assert_eq "CLAUDE_CODE_OAUTH_TOKEN not exported for full login" "${CLAUDE_CODE_OAUTH_TOKEN:-_NONE_}" "_NONE_"
+  out="$(cs use ../foo 2>&1)"; assert_contains "rejects traversal" "$out" "invalid profile name"
+  out="$(cs use 2>&1)"; assert_contains "no-arg usage" "$out" "cs use"
+  out="$(cs use ghost 2>&1)"; assert_contains "missing profile" "$out" "not set up"
   teardown
 }
 
-t_use_legacy_profile_stays_token_after_wrapper_patch() {
-  echo "[use: legacy token path is not promoted by wrapper patch]"
-  setup
-  seed_profile personal
-  cs use personal >/dev/null 2>&1
-  claude >/dev/null 2>&1
-  cs off >/dev/null 2>&1
-
-  cs use personal >|"$SANDBOX/.use.out" 2>&1
-  local out
-  out="$(<"$SANDBOX/.use.out")"
-  assert_contains "use still reports setup-token fallback" "$out" "setup-token fallback"
-  assert_eq "legacy profile keeps token exported" "${CLAUDE_CODE_OAUTH_TOKEN:-}" "sk-ant-oat01-FAKE-TOKEN-FOR-TESTS"
-  assert_file_absent "legacy wrapper patch does not create full-login marker" "$HOME/.claude/profiles/personal/.cs-full-login"
-  teardown
-}
-
-t_login_does_not_inherit_setup_token() {
-  echo "[login: full auth login does not inherit setup-token env]"
-  setup
-  seed_profile personal
-  cs use personal >/dev/null 2>&1
-
-  local out
-  out="$(cs login work --claudeai 2>&1)"
-  assert_contains "login invokes claude auth login" "$out" "FAKE_CLAUDE_AUTH_LOGIN: auth login --claudeai"
-  assert_file_absent "auth login subprocess did not inherit setup token" "$HOME/.auth-login-token-env"
-  assert_file_exists "full login marker written" "$HOME/.claude/profiles/work/.cs-full-login"
-  assert_file_mode "full login marker mode 600" "$HOME/.claude/profiles/work/.cs-full-login" "600"
-  assert_eq "current shell still has original setup token" "${CLAUDE_CODE_OAUTH_TOKEN:-}" "sk-ant-oat01-FAKE-TOKEN-FOR-TESTS"
-  teardown
-}
-
-t_off_unsets() {
+t_off_clears_env() {
   echo "[off: clears env]"
   setup
   seed_profile personal
   cs use personal >/dev/null 2>&1
   cs off >/dev/null 2>&1
   assert_eq "_CS_PROFILE unset" "${_CS_PROFILE:-_NONE_}" "_NONE_"
-  assert_eq "CLAUDE_CODE_OAUTH_TOKEN unset" "${CLAUDE_CODE_OAUTH_TOKEN:-_NONE_}" "_NONE_"
   assert_eq "CLAUDE_CONFIG_DIR unset" "${CLAUDE_CONFIG_DIR:-_NONE_}" "_NONE_"
-  teardown
-}
-
-t_off_unpinned_does_not_restore_other_shell_patch() {
-  echo "[off: unpinned shell has no shared restore side effect]"
-  setup
-  seed_profile work
-  cs use work >/dev/null 2>&1
-  claude >/dev/null 2>&1
-  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR
-
-  cs off >/dev/null 2>&1
-  local email
-  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
-  assert_eq "unpinned cs off leaves another shell's patch alone" "$email" "before@example.com"
-  assert_file_absent "global last-patch marker absent for isolated profile" "$HOME/.claude/accounts/.cs-last-patch.json"
+  assert_eq "CLAUDE_CODE_OAUTH_TOKEN unset" "${CLAUDE_CODE_OAUTH_TOKEN:-_NONE_}" "_NONE_"
   teardown
 }
 
@@ -642,87 +261,18 @@ t_list() {
   echo "[list]"
   setup
   local out
-  out="$(cs list 2>&1)"
-  assert_contains "list with no profiles" "$out" "no profiles"
+  out="$(cs list 2>&1)"; assert_contains "empty list" "$out" "no profiles"
   seed_profile personal
-  seed_profile work
-  # incomplete profile (token but no account snapshot)
-  printf 'sk-ant-oat01-x' >"$HOME/.claude/accounts/halfbaked.token"
+  seed_profile work work@corp.com
+  mkdir -p "$HOME/.claude/profiles/halfbaked"   # dir, no login
   out="$(cs list 2>&1)"
-  assert_contains "list shows personal email" "$out" "personal@example.com"
-  assert_contains "list shows work email" "$out" "work@example.com"
-  assert_contains "incomplete profile flagged" "$out" "incomplete"
+  assert_contains "shows personal email" "$out" "personal@example.com"
+  assert_contains "shows work email" "$out" "work@corp.com"
+  assert_contains "incomplete flagged" "$out" "incomplete"
   cs use personal >/dev/null 2>&1
   out="$(cs list 2>&1)"
-  assert_contains "pinned profile gets * marker" "$out" "* personal"
-  assert_contains "non-pinned profile no marker" "$out" "  work"
-  teardown
-}
-
-t_doctor() {
-  echo "[doctor: validates tokens against API]"
-  setup
-  local out
-  out="$(cs doctor 2>&1)"
-  assert_contains "doctor with no profiles" "$out" "no profiles"
-
-  seed_profile personal
-  seed_profile work sk-ant-oat01-EXPIRED-TOKEN
-  seed_profile dead sk-ant-oat01-DOWN-TOKEN
-
-  out="$(cs doctor 2>&1)"
-  assert_contains "healthy token reported OK" "$out" "personal@example.com: OK"
-  assert_contains "expired token reported EXPIRED" "$out" "work@example.com: EXPIRED (401)"
-  assert_contains "unreachable token reported unverified" "$out" "dead@example.com: UNREACHABLE (no network/curl) — NOT VERIFIED"
-  assert_contains "expired triggers re-mint hint" "$out" "cs save <name> --force"
-
-  # Non-zero exit when any token is expired (for scripting).
-  cs doctor >/dev/null 2>&1
-  assert_eq "doctor returns 1 when a token is expired" "$?" "1"
-
-  # Identity mismatch: token is live but belongs to a different org than the
-  # snapshot — must be flagged and fail the run.
-  seed_profile impostor sk-ant-oat01-OTHERORG-TOKEN
-  out="$(cs doctor 2>&1)"
-  assert_contains "mismatched profile flagged" "$out" "impostor — impostor@example.com: OK — ORG MISMATCH"
-  assert_contains "mismatch hint mentions re-save" "$out" "cs save <name> --force"
-  rm -f "$HOME/.claude/accounts/impostor."*
-
-  # All-healthy run exits 0 and pins the * marker on the active profile.
-  rm -f "$HOME/.claude/accounts/work."* "$HOME/.claude/accounts/dead."*
-  cs use personal >/dev/null 2>&1
-  out="$(cs doctor 2>&1)"
-  assert_contains "active profile gets * marker" "$out" "* personal"
-  cs doctor >/dev/null 2>&1
-  assert_eq "doctor returns 0 when all healthy" "$?" "0"
-
-  # A mismatch alone (no expired tokens) must still fail the run.
-  seed_profile impostor sk-ant-oat01-OTHERORG-TOKEN
-  cs doctor >/dev/null 2>&1
-  assert_eq "doctor returns 1 on mismatch alone" "$?" "1"
-  rm -f "$HOME/.claude/accounts/impostor."*
-
-  # An indeterminate token check must fail even when no token is proven expired.
-  seed_profile dead sk-ant-oat01-DOWN-TOKEN
-  out="$(cs doctor 2>&1)"
-  assert_contains "doctor warns when token cannot be verified" "$out" "one or more tokens could not be verified"
-  cs doctor >/dev/null 2>&1
-  assert_eq "doctor returns 1 on unverified token alone" "$?" "1"
-  rm -f "$HOME/.claude/accounts/dead."*
-
-  # Missing org data must not pass identity checking silently.
-  seed_profile noorg sk-ant-oat01-NOORG-TOKEN
-  out="$(cs doctor 2>&1)"
-  assert_contains "doctor flags missing token org" "$out" "noorg — noorg@example.com: OK — IDENTITY UNKNOWN"
-  cs doctor >/dev/null 2>&1
-  assert_eq "doctor returns 1 on missing token org" "$?" "1"
-  rm -f "$HOME/.claude/accounts/noorg."*
-
-  seed_profile old sk-ant-oat01-VALID-TOKEN ""
-  out="$(cs doctor 2>&1)"
-  assert_contains "doctor flags missing snapshot org" "$out" "old — old@example.com: OK — IDENTITY UNKNOWN"
-  cs doctor >/dev/null 2>&1
-  assert_eq "doctor returns 1 on missing snapshot org" "$?" "1"
+  assert_contains "pinned gets * marker" "$out" "* personal"
+  assert_contains "non-pinned no marker" "$out" "  work"
   teardown
 }
 
@@ -731,77 +281,41 @@ t_current() {
   setup
   seed_profile personal
   local out
-  out="$(cs current 2>&1)"
-  assert_contains "current when unset" "$out" "none"
+  out="$(cs current 2>&1)"; assert_contains "none when unset" "$out" "none"
   cs use personal >/dev/null 2>&1
-  out="$(cs current 2>&1)"
-  assert_eq "current when set" "$out" "personal"
-
+  out="$(cs current 2>&1)"; assert_eq "reports pin" "$out" "personal"
   unset _CS_PROFILE
-  out="$(cs current 2>&1)"
-  assert_contains "current warns on config/profile mismatch" "$out" "profile config set, name unknown"
-  assert_contains "current mismatch includes recovery hint" "$out" "re-run: cs use <name>"
+  out="$(cs current 2>&1)"; assert_contains "warns on config-set-name-unknown" "$out" "name unknown"
   teardown
 }
 
 t_resource_preserves_profile() {
-  echo "[re-source: preserves active profile pin]"
+  echo "[re-source: preserves active pin]"
   setup
   seed_profile personal
   cs use personal >/dev/null 2>&1
-
   source "$CS_ZSH"
-
-  assert_eq "_CS_PROFILE preserved after re-source" "${_CS_PROFILE:-_NONE_}" "personal"
-  local out
-  out="$(cs current 2>&1)"
-  assert_eq "current still reports pinned profile after re-source" "$out" "personal"
+  assert_eq "_CS_PROFILE preserved" "${_CS_PROFILE:-_NONE_}" "personal"
   teardown
 }
 
-t_rm_invalid_name() {
-  echo "[rm: invalid name rejected — no fs side effects]"
+t_rm() {
+  echo "[rm: prompt, deletes config, guards traversal]"
   setup
-  # Plant a sentinel file that a path-traversal rm would otherwise hit
-  echo "DO NOT DELETE" >"$HOME/.claude/sentinel.token"
+  # traversal guard: plant a sentinel a naive rm would nuke
+  mkdir -p "$HOME/.claude/profiles"
+  echo "keep" >"$HOME/.claude/sentinel"
   local out
-  out="$(cs rm "../sentinel" 2>&1)"
-  assert_contains "rm '../sentinel' rejected" "$out" "invalid profile name"
-  assert_file_exists "sentinel survived path-traversal rm" "$HOME/.claude/sentinel.token"
-  out="$(cs rm 2>&1)"
-  assert_contains "rm no-arg shows usage" "$out" "cs rm"
-  teardown
-}
+  out="$(cs rm ../sentinel 2>&1)"; assert_contains "rejects traversal" "$out" "invalid profile name"
+  assert_file_exists "sentinel survived" "$HOME/.claude/sentinel"
+  out="$(cs rm ghost 2>&1)"; assert_contains "missing profile" "$out" "no such profile"
 
-t_rm_nonexistent() {
-  echo "[rm: nonexistent profile errors]"
-  setup
-  local out
-  out="$(cs rm ghost 2>&1)"
-  assert_contains "rm ghost reports missing" "$out" "no such profile"
-  teardown
-}
-
-t_rm_aborted_no() {
-  echo "[rm: declining the prompt aborts]"
-  setup
   seed_profile personal
-  local out
-  out="$(printf 'n\n' | cs rm personal 2>&1)"
-  assert_contains "rm aborted on n" "$out" "aborted"
-  assert_file_exists "token kept after abort" "$HOME/.claude/accounts/personal.token"
-  teardown
-}
+  out="$(printf 'n\n' | cs rm personal 2>&1)"; assert_contains "declined aborts" "$out" "aborted"
+  assert_file_exists "config kept after abort" "$HOME/.claude/profiles/personal/.claude.json"
 
-t_rm_confirmed_yes() {
-  echo "[rm: confirming the prompt deletes both files]"
-  setup
-  seed_profile personal
-  seed_full_login_profile personal
   printf 'y\n' | cs rm personal >/dev/null 2>&1
-  assert_file_absent "token removed" "$HOME/.claude/accounts/personal.token"
-  assert_file_absent "account snapshot removed" "$HOME/.claude/accounts/personal.account.json"
-  assert_file_absent "profile config removed" "$HOME/.claude/profiles/personal"
+  assert_dir_absent "config removed on confirm" "$HOME/.claude/profiles/personal"
   teardown
 }
 
@@ -812,194 +326,95 @@ t_rm_pinned_clears_env() {
   cs use personal >/dev/null 2>&1
   printf 'y\n' | cs rm personal >/dev/null 2>&1
   assert_eq "_CS_PROFILE cleared" "${_CS_PROFILE:-_NONE_}" "_NONE_"
-  assert_eq "CLAUDE_CODE_OAUTH_TOKEN cleared" "${CLAUDE_CODE_OAUTH_TOKEN:-_NONE_}" "_NONE_"
   assert_eq "CLAUDE_CONFIG_DIR cleared" "${CLAUDE_CONFIG_DIR:-_NONE_}" "_NONE_"
   teardown
 }
 
-t_claude_wrapper_unpinned_passthrough() {
-  echo "[claude wrapper: unpinned just passes through]"
+t_doctor_healthy_and_duplicate() {
+  echo "[doctor: healthy profiles + duplicate-account detection]"
+  setup
+  seed_profile personal personal@example.com
+  seed_profile work work@corp.com
+  local out
+  out="$(cs doctor 2>&1)"
+  assert_contains "personal reported" "$out" "personal — personal@example.com (claude.ai)"
+  assert_contains "work reported" "$out" "work — work@corp.com (claude.ai)"
+  cs doctor >/dev/null 2>&1
+  assert_eq "healthy distinct profiles exit 0" "$?" "0"
+
+  # Now make two profiles share an account -> must flag + fail.
+  seed_profile work2 personal@example.com
+  out="$(cs doctor 2>&1)"
+  assert_contains "duplicate flagged" "$out" "DUPLICATE — 'personal@example.com'"
+  assert_contains "duplicate lists both slots" "$out" "personal, work2"
+  cs doctor >/dev/null 2>&1
+  assert_eq "duplicate exits 1" "$?" "1"
+  teardown
+}
+
+t_doctor_default_duplicate() {
+  echo "[doctor: default namespace duplicating a profile is flagged]"
+  setup
+  seed_profile personal personal@example.com
+  # Default (no CLAUDE_CONFIG_DIR) also logged into the same account.
+  cat >"$HOME/.claude/.claude.json" <<'JSON'
+{"oauthAccount":{"emailAddress":"personal@example.com","organizationUuid":"org-default"}}
+JSON
+  local out
+  out="$(cs doctor 2>&1)"
+  assert_contains "default listed" "$out" "(default) — personal@example.com"
+  assert_contains "default duplicate flagged" "$out" "DUPLICATE — 'personal@example.com'"
+  assert_contains "hint to log default out" "$out" "claude auth logout"
+  teardown
+}
+
+t_doctor_not_logged_in() {
+  echo "[doctor: profile dir without login is flagged]"
+  setup
+  mkdir -p "$HOME/.claude/profiles/empty"
+  local out
+  out="$(cs doctor 2>&1)"
+  assert_contains "empty profile flagged" "$out" "empty — NOT LOGGED IN"
+  cs doctor >/dev/null 2>&1
+  assert_eq "not-logged-in exits 1" "$?" "1"
+  teardown
+}
+
+t_wrapper_unpinned_passthrough() {
+  echo "[wrapper: unpinned passes through]"
   setup
   local out
   out="$(claude hello 2>&1)"
   assert_contains "fake claude invoked" "$out" "FAKE_CLAUDE: hello"
-  assert_not_contains "no profile prefix when unpinned" "$out" "launching claude"
+  assert_not_contains "no profile prefix" "$out" "launching claude"
   teardown
 }
 
-t_claude_wrapper_pinned_patches_json() {
-  echo "[claude wrapper: pinned patches active profile config]"
+t_wrapper_pinned_announces_and_aligns() {
+  echo "[wrapper: pinned announces account and aligns config dir]"
   setup
   seed_profile personal
   cs use personal >/dev/null 2>&1
-  local out
-  out="$(claude foo 2>&1)"
-  assert_contains "wrapper announces profile" "$out" "launching claude as 'personal'"
-  assert_contains "fake claude got args" "$out" "FAKE_CLAUDE: foo"
-  # Verify the active profile config's oauthAccount was rewritten.
-  local email
-  email="$(jq -r '.oauthAccount.emailAddress' "$CLAUDE_CONFIG_DIR/.claude.json")"
-  assert_eq "oauthAccount email patched to profile's" "$email" "personal@example.com"
-  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
-  assert_eq "global oauthAccount untouched" "$email" "before@example.com"
+  # Drift CLAUDE_CONFIG_DIR; wrapper should realign it to the pin. Run in the
+  # current shell (redirect, not $(...)) so the realigning export is observable.
+  export CLAUDE_CONFIG_DIR="/wrong/place"
+  claude foo >|"$SANDBOX/.out" 2>&1
+  local out; out="$(<"$SANDBOX/.out")"
+  assert_contains "announces profile" "$out" "launching claude as 'personal'"
+  assert_contains "shows email" "$out" "personal@example.com"
+  assert_contains "passes args through" "$out" "FAKE_CLAUDE: foo"
+  assert_eq "config dir realigned to pin" "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude/profiles/personal"
   teardown
 }
 
-t_claude_wrapper_invalid_profile() {
-  echo "[claude wrapper: refuses bad _CS_PROFILE]"
+t_wrapper_refuses_bad_profile() {
+  echo "[wrapper: refuses invalid _CS_PROFILE]"
   setup
   _CS_PROFILE="../escape"
   local out
   out="$(claude 2>&1)"
-  assert_contains "wrapper refuses path-traversal _CS_PROFILE" "$out" "refusing to launch"
+  assert_contains "refuses traversal profile" "$out" "refusing to launch"
   assert_not_contains "fake claude NOT invoked" "$out" "FAKE_CLAUDE"
-  teardown
-}
-
-t_save_rejects_dead_token() {
-  echo "[save: dead token refused]"
-  setup
-  local out
-  out="$(printf 'sk-ant-oat01-EXPIRED-TOKEN' | cs save personal 2>&1)"
-  assert_contains "expired token refused" "$out" "not usable"
-  assert_file_absent "no token file for dead token" "$HOME/.claude/accounts/personal.token"
-  teardown
-}
-
-t_save_forbidden_token_saves_unverified() {
-  echo "[save: 403 verification is indeterminate, not expired]"
-  setup
-  local out
-  out="$(printf 'sk-ant-oat01-FORBIDDEN-TOKEN' | cs save personal 2>&1)"
-  assert_contains "403 verification warns" "$out" "could not verify the token (FORBIDDEN (403))"
-  assert_contains "403 verification still saves" "$out" "saved profile 'personal'"
-  assert_file_exists "token file written after 403" "$HOME/.claude/accounts/personal.token"
-  teardown
-}
-
-t_save_rejects_org_mismatch() {
-  echo "[save: token/snapshot identity mismatch refused]"
-  setup
-  local out
-  # Token authenticates as org-elsewhere; ~/.claude.json login is org-home.
-  out="$(printf 'sk-ant-oat01-OTHERORG-TOKEN' | cs save work 2>&1)"
-  assert_contains "mismatch refused" "$out" "identity mismatch"
-  assert_contains "mismatch names the CLI login" "$out" "before@example.com"
-  assert_contains "mismatch offers override" "$out" "--allow-mismatch"
-  assert_file_absent "no token file on mismatch" "$HOME/.claude/accounts/work.token"
-  assert_file_absent "no snapshot on mismatch" "$HOME/.claude/accounts/work.account.json"
-
-  # Explicit override saves, with a warning.
-  out="$(printf 'sk-ant-oat01-OTHERORG-TOKEN' | cs save work --allow-mismatch 2>&1)"
-  assert_contains "override warns" "$out" "Saving anyway"
-  assert_contains "override still reports success" "$out" "saved profile 'work'"
-  assert_file_exists "token saved with override" "$HOME/.claude/accounts/work.token"
-  teardown
-}
-
-t_save_rejects_unchecked_identity() {
-  echo "[save: unchecked token identity refused]"
-  setup
-  local out
-
-  out="$(printf 'sk-ant-oat01-NOORG-TOKEN' | cs save noorg 2>&1)"
-  assert_contains "missing token org refused" "$out" "could not verify token/account identity"
-  assert_contains "missing token org offers override" "$out" "--allow-mismatch"
-  assert_file_absent "no token file when token org is missing" "$HOME/.claude/accounts/noorg.token"
-
-  out="$(printf 'sk-ant-oat01-NOORG-TOKEN' | cs save noorg --allow-mismatch 2>&1)"
-  assert_contains "missing token org override warns" "$out" "saving anyway"
-  assert_contains "missing token org override succeeds" "$out" "saved profile 'noorg'"
-  rm -f "$HOME/.claude/accounts/noorg."*
-
-  local tmp
-  tmp="$(mktemp)"
-  jq 'del(.oauthAccount.organizationUuid)' "$HOME/.claude.json" >"$tmp" && mv "$tmp" "$HOME/.claude.json"
-  out="$(printf 'sk-ant-oat01-VALID-TOKEN' | cs save old 2>&1)"
-  assert_contains "missing snapshot org refused" "$out" "could not verify token/account identity"
-  assert_file_absent "no token file when snapshot org is missing" "$HOME/.claude/accounts/old.token"
-  teardown
-}
-
-t_save_unreachable_saves_with_warning() {
-  echo "[save: unreachable API saves unverified]"
-  setup
-  local out
-  out="$(printf 'sk-ant-oat01-DOWN-TOKEN' | cs save personal 2>&1)"
-  assert_contains "offline save warns" "$out" "could not verify"
-  assert_contains "offline save succeeds" "$out" "saved profile 'personal'"
-  assert_file_exists "token saved offline" "$HOME/.claude/accounts/personal.token"
-  teardown
-}
-
-t_save_escapes_curl_config_token() {
-  echo "[save: curl config escapes token metacharacters]"
-  setup
-  local out token
-  token='sk-ant-oat01-QUOTE"-TOKEN'
-  out="$(printf '%s' "$token" | cs save quoted 2>&1)"
-  assert_not_contains "quote did not break curl config verification" "$out" "could not verify"
-  assert_contains "quoted token saved after verification" "$out" "saved profile 'quoted'"
-  teardown
-}
-
-t_claude_wrapper_unpinned_restores_keychain() {
-  echo "[claude wrapper: pinned launch leaves global config untouched]"
-  setup
-  seed_profile work
-  cs use work >/dev/null 2>&1
-  claude >/dev/null 2>&1
-  local email
-  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
-  assert_eq "global config untouched by pinned launch" "$email" "before@example.com"
-  email="$(jq -r '.oauthAccount.emailAddress' "$CLAUDE_CONFIG_DIR/.claude.json")"
-  assert_eq "profile config shows profile identity" "$email" "work@example.com"
-
-  cs off >/dev/null 2>&1
-  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
-  assert_eq "cs off leaves global config untouched" "$email" "before@example.com"
-  assert_file_exists "profile config remains for future use" "$HOME/.claude/profiles/work/.claude.json"
-
-  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR
-  claude >/dev/null 2>&1
-  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
-  assert_eq "unpinned launch still uses global config" "$email" "before@example.com"
-  teardown
-}
-
-t_claude_wrapper_restore_respects_relogin() {
-  echo "[claude wrapper: profile relogin stays profile-local]"
-  setup
-  seed_profile work
-  cs use work >/dev/null 2>&1
-  claude >/dev/null 2>&1
-  # Simulate the user running /login inside the isolated profile.
-  local tmp
-  tmp="$(mktemp)"
-  jq '.oauthAccount = {"emailAddress":"fresh-login@example.com","organizationUuid":"org-fresh"}' \
-    "$CLAUDE_CONFIG_DIR/.claude.json" >"$tmp" && mv "$tmp" "$CLAUDE_CONFIG_DIR/.claude.json"
-  unset _CS_PROFILE CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR
-  claude >/dev/null 2>&1
-  local email
-  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude.json")"
-  assert_eq "global config left untouched" "$email" "before@example.com"
-  email="$(jq -r '.oauthAccount.emailAddress' "$HOME/.claude/profiles/work/.claude.json")"
-  assert_eq "profile relogin left untouched" "$email" "fresh-login@example.com"
-  teardown
-}
-
-t_claude_wrapper_skips_symlink_cfg() {
-  echo "[claude wrapper: skips patch when active profile config is a symlink]"
-  setup
-  seed_profile personal
-  cs use personal >/dev/null 2>&1
-  rm -f "$CLAUDE_CONFIG_DIR/.claude.json"
-  ln -s "$HOME/elsewhere.json" "$CLAUDE_CONFIG_DIR/.claude.json"
-  local out
-  out="$(claude 2>&1)"
-  assert_contains "symlink warning emitted" "$out" "symlink"
-  assert_contains "fake claude still launched" "$out" "FAKE_CLAUDE"
-  assert_file_absent "did NOT create symlink target" "$HOME/elsewhere.json"
   teardown
 }
 
@@ -1007,53 +422,23 @@ t_claude_wrapper_skips_symlink_cfg() {
 
 t_validate_name
 t_help
-t_save_invalid_name
-t_save_happy_path_stdin
-t_save_strips_whitespace
-t_save_force_required_to_overwrite
-t_save_empty_token_rejected
-t_save_bad_prefix_rejected_no_leak
-t_save_token_flag_warning
-t_save_missing_user_cfg
-t_save_missing_oauth_account
-t_save_umask_not_leaked
-t_save_unknown_flag
-t_save_too_many_args
-t_save_stdin_flag_explicit
-t_save_no_input_method
-t_save_no_clipboard_no_stdin
-t_clipboard_helpers_route_through_indirection
-t_stat_mode_helper
-t_save_clipboard_clears_after_use
-t_use_invalid_name
-t_use_missing_files
-t_use_happy_path
-t_use_full_login_prefers_config
-t_use_legacy_profile_stays_token_after_wrapper_patch
-t_login_does_not_inherit_setup_token
-t_off_unsets
+t_sha256_matches_claude_scheme
+t_login_isolated_no_token_leak
+t_login_default_args_prefill_email
+t_use_sets_env_no_token
+t_use_invalid_and_missing
+t_off_clears_env
 t_list
-t_doctor
 t_current
 t_resource_preserves_profile
-t_rm_invalid_name
-t_rm_nonexistent
-t_rm_aborted_no
-t_rm_confirmed_yes
+t_rm
 t_rm_pinned_clears_env
-t_off_unpinned_does_not_restore_other_shell_patch
-t_save_rejects_dead_token
-t_save_forbidden_token_saves_unverified
-t_save_rejects_org_mismatch
-t_save_rejects_unchecked_identity
-t_save_unreachable_saves_with_warning
-t_save_escapes_curl_config_token
-t_claude_wrapper_unpinned_passthrough
-t_claude_wrapper_pinned_patches_json
-t_claude_wrapper_invalid_profile
-t_claude_wrapper_unpinned_restores_keychain
-t_claude_wrapper_restore_respects_relogin
-t_claude_wrapper_skips_symlink_cfg
+t_doctor_healthy_and_duplicate
+t_doctor_default_duplicate
+t_doctor_not_logged_in
+t_wrapper_unpinned_passthrough
+t_wrapper_pinned_announces_and_aligns
+t_wrapper_refuses_bad_profile
 
 #------------------------------------------------------------------- summary
 
