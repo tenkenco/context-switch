@@ -1,0 +1,38 @@
+name: zizmor
+
+# Static security analysis of the GitHub Actions workflows themselves
+# (script injection, over-broad permissions, unpinned actions, cache/artifact
+# poisoning, credential persistence). This repo's main attack surface is CI, so
+# the workflows get their own audit.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        env:
+          # zizmor uses the token for online audits (e.g. resolving action refs).
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pipx run --spec zizmor==1.26.1 zizmor --persona regular .github/workflows
