@@ -292,7 +292,8 @@ _cs_rm() {
     local -a dirs=("$cfg_dir")
     [[ "${cfg_dir:A}" != "$cfg_dir" ]] && dirs+=("${cfg_dir:A}")
     for d in "${dirs[@]}"; do
-      svc="$(_cs_keychain_service "$d")" && [[ -n "$svc" ]] || continue
+      svc="$(_cs_keychain_service "$d")"
+      [[ -n "$svc" ]] || continue
       while security delete-generic-password -s "$svc" >/dev/null 2>&1; do removed=1; done
       security find-generic-password -s "$svc" >/dev/null 2>&1 && leftover=1
     done
