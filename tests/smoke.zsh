@@ -176,11 +176,16 @@ t_help() {
   echo "[help]"
   setup
   local out
-  out="$(cs help 2>&1)"; assert_contains "cs help mentions Usage" "$out" "Usage:"
-  out="$(cs --help 2>&1)"; assert_contains "cs --help works" "$out" "Usage:"
-  out="$(cs -h 2>&1)"; assert_contains "cs -h works" "$out" "Usage:"
-  out="$(cs 2>&1)"; assert_contains "cs (no args) shows help" "$out" "Usage:"
-  out="$(cs unknown 2>&1)"; assert_contains "unknown subcommand error" "$out" "unknown subcommand"
+  out="$(cs help 2>&1)"
+  assert_contains "cs help mentions Usage" "$out" "Usage:"
+  out="$(cs --help 2>&1)"
+  assert_contains "cs --help works" "$out" "Usage:"
+  out="$(cs -h 2>&1)"
+  assert_contains "cs -h works" "$out" "Usage:"
+  out="$(cs 2>&1)"
+  assert_contains "cs (no args) shows help" "$out" "Usage:"
+  out="$(cs unknown 2>&1)"
+  assert_contains "unknown subcommand error" "$out" "unknown subcommand"
   teardown
 }
 
@@ -238,7 +243,8 @@ t_use_sets_env_no_token() {
   seed_profile personal
   export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-STALE"
   cs use personal >|"$SANDBOX/.out" 2>&1
-  local out; out="$(<"$SANDBOX/.out")"
+  local out
+  out="$(<"$SANDBOX/.out")"
   assert_contains "reports pin + email" "$out" "personal@example.com"
   assert_eq "_CS_PROFILE set" "${_CS_PROFILE:-}" "personal"
   assert_eq "CLAUDE_CONFIG_DIR exported" "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude/profiles/personal"
@@ -252,9 +258,12 @@ t_use_invalid_and_missing() {
   echo "[use: invalid + missing handled]"
   setup
   local out
-  out="$(cs use ../foo 2>&1)"; assert_contains "rejects traversal" "$out" "invalid profile name"
-  out="$(cs use 2>&1)"; assert_contains "no-arg usage" "$out" "cs use"
-  out="$(cs use ghost 2>&1)"; assert_contains "missing profile" "$out" "not set up"
+  out="$(cs use ../foo 2>&1)"
+  assert_contains "rejects traversal" "$out" "invalid profile name"
+  out="$(cs use 2>&1)"
+  assert_contains "no-arg usage" "$out" "cs use"
+  out="$(cs use ghost 2>&1)"
+  assert_contains "missing profile" "$out" "not set up"
   teardown
 }
 
@@ -274,10 +283,11 @@ t_list() {
   echo "[list]"
   setup
   local out
-  out="$(cs list 2>&1)"; assert_contains "empty list" "$out" "no profiles"
+  out="$(cs list 2>&1)"
+  assert_contains "empty list" "$out" "no profiles"
   seed_profile personal
   seed_profile work work@corp.com
-  mkdir -p "$HOME/.claude/profiles/halfbaked"   # dir, no login
+  mkdir -p "$HOME/.claude/profiles/halfbaked" # dir, no login
   out="$(cs list 2>&1)"
   assert_contains "shows personal email" "$out" "personal@example.com"
   assert_contains "shows work email" "$out" "work@corp.com"
@@ -294,11 +304,14 @@ t_current() {
   setup
   seed_profile personal
   local out
-  out="$(cs current 2>&1)"; assert_contains "none when unset" "$out" "none"
+  out="$(cs current 2>&1)"
+  assert_contains "none when unset" "$out" "none"
   cs use personal >/dev/null 2>&1
-  out="$(cs current 2>&1)"; assert_eq "reports pin" "$out" "personal"
+  out="$(cs current 2>&1)"
+  assert_eq "reports pin" "$out" "personal"
   unset _CS_PROFILE
-  out="$(cs current 2>&1)"; assert_contains "warns on config-set-name-unknown" "$out" "name unknown"
+  out="$(cs current 2>&1)"
+  assert_contains "warns on config-set-name-unknown" "$out" "name unknown"
   teardown
 }
 
@@ -319,12 +332,15 @@ t_rm() {
   mkdir -p "$HOME/.claude/profiles"
   echo "keep" >"$HOME/.claude/sentinel"
   local out
-  out="$(cs rm ../sentinel 2>&1)"; assert_contains "rejects traversal" "$out" "invalid profile name"
+  out="$(cs rm ../sentinel 2>&1)"
+  assert_contains "rejects traversal" "$out" "invalid profile name"
   assert_file_exists "sentinel survived" "$HOME/.claude/sentinel"
-  out="$(cs rm ghost 2>&1)"; assert_contains "missing profile" "$out" "no such profile"
+  out="$(cs rm ghost 2>&1)"
+  assert_contains "missing profile" "$out" "no such profile"
 
   seed_profile personal
-  out="$(printf 'n\n' | cs rm personal 2>&1)"; assert_contains "declined aborts" "$out" "aborted"
+  out="$(printf 'n\n' | cs rm personal 2>&1)"
+  assert_contains "declined aborts" "$out" "aborted"
   assert_file_exists "config kept after abort" "$HOME/.claude/profiles/personal/.claude.json"
 
   printf 'y\n' | cs rm personal >/dev/null 2>&1
@@ -412,7 +428,8 @@ t_wrapper_pinned_announces_and_aligns() {
   # current shell (redirect, not $(...)) so the realigning export is observable.
   export CLAUDE_CONFIG_DIR="/wrong/place"
   claude foo >|"$SANDBOX/.out" 2>&1
-  local out; out="$(<"$SANDBOX/.out")"
+  local out
+  out="$(<"$SANDBOX/.out")"
   assert_contains "announces profile" "$out" "launching claude as 'personal'"
   assert_contains "shows email" "$out" "personal@example.com"
   assert_contains "passes args through" "$out" "FAKE_CLAUDE: foo"
@@ -441,7 +458,8 @@ t_wrapper_scrubs_override_auth_vars() {
   export CLAUDE_CODE_USE_VERTEX="1"
   cs use personal >/dev/null 2>&1
   claude go >/dev/null 2>&1
-  local launched; launched="$(<"$HOME/.claude-launch-env")"
+  local launched
+  launched="$(<"$HOME/.claude-launch-env")"
   assert_eq "launched claude saw no overriding auth vars" "$launched" "API= TOKEN= BEDROCK= VERTEX="
   # And the user's interactive shell keeps its own API key (not clobbered).
   assert_eq "shell ANTHROPIC_API_KEY preserved" "${ANTHROPIC_API_KEY:-}" "sk-ant-api-LEAK"
@@ -456,7 +474,8 @@ t_doctor_unpinned_does_not_star_default() {
 {"oauthAccount":{"emailAddress":"other@example.com","organizationUuid":"org-default"}}
 JSON
   unset _CS_PROFILE
-  local out; out="$(cs doctor 2>&1)"
+  local out
+  out="$(cs doctor 2>&1)"
   assert_contains "default listed" "$out" "(default) — other@example.com"
   assert_not_contains "default NOT starred when unpinned" "$out" "* (default)"
   teardown

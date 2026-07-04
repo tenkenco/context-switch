@@ -293,7 +293,7 @@ _cs_rm() {
       while security delete-generic-password -s "$svc" >/dev/null 2>&1; do removed=1; done
       security find-generic-password -s "$svc" >/dev/null 2>&1 && leftover=1
     done
-    if ((leftover)) || { ((! removed)) && security find-generic-password -s "Claude Code-credentials-$(_cs_sha256_8 "$cfg_dir")" >/dev/null 2>&1; }; then
+    if ((leftover)) || { ((!removed)) && security find-generic-password -s "Claude Code-credentials-$(_cs_sha256_8 "$cfg_dir")" >/dev/null 2>&1; }; then
       echo "cs: warning — a keychain credential for '$name' may remain (Claude Code's naming scheme may have changed). Check with: security dump-keychain | grep 'Claude Code-credentials'" >&2
     fi
   fi
