@@ -17,10 +17,17 @@ jobs:
   static-checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 20
 
@@ -28,6 +35,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck shfmt zsh
+          # Linter installed globally in an ephemeral CI runner — no lockfile
+          # needed (zizmor flags this as a low-severity adhoc-packages note).
           npm install --global markdownlint-cli2
 
       - name: Check shell formatting
@@ -38,12 +47,22 @@ jobs:
         run: |
           shellcheck -x install.sh cs.zsh claude-switch.plugin.zsh
 
+      - name: Lint GitHub Actions workflows
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL "$url" -o actionlint.tar.gz
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -color
+
       - name: Lint Markdown
         run: |
           markdownlint-cli2 '**/*.md' '#node_modules'
 
       - name: Check typos
-        uses: crate-ci/typos@v1.40.0
+        uses: crate-ci/typos@2d0ce569feab1f8752f1dde43cc2f2aa53236e06 # v1.40.0
         with:
           files: .
 
@@ -58,17 +77,26 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      # harden-runner is Linux-only; skip it on the macOS matrix leg.
+      - name: Harden the runner
+        if: runner.os == 'Linux'
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install jq || true   # macOS images already ship jq
+        run: brew install jq || true # macOS images already ship jq
 
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y zsh jq xclip
+          sudo apt-get install -y zsh jq
 
       - name: Run smoke tests
         run: ./tests/smoke.zsh

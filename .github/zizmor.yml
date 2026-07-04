@@ -1,0 +1,8 @@
+# zizmor configuration — https://docs.zizmor.sh/configuration/
+rules:
+  adhoc-packages:
+    # markdownlint-cli2 is a lint tool installed globally into an ephemeral CI
+    # runner (no project lockfile applies). Accepted; still fail on any other
+    # adhoc install elsewhere.
+    ignore:
+      - test.yml

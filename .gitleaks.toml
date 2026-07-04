@@ -1,0 +1,21 @@
+# gitleaks configuration — extends the built-in ruleset.
+# https://github.com/gitleaks/gitleaks
+#
+# claude-switch handles real OAuth credentials at runtime but never stores them
+# in the repo. This config guards against a secret being committed by accident.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Smoke tests use obviously-fake placeholder Claude tokens."
+# The test fixtures deliberately contain sk-ant-* placeholders; ignore that file
+# wholesale so real-secret detection elsewhere is not diluted.
+paths = [
+  '''tests/smoke\.zsh''',
+]
+# Belt-and-suspenders: also match the fake-token shapes by content, in case the
+# fixtures are refactored into another file later.
+regexes = [
+  '''sk-ant-(oat01|api)[A-Za-z0-9_-]*(LEAK|STALE|TESTS|SHOULD-NOT-LEAK|FROM-CLIPBOARD)''',
+]

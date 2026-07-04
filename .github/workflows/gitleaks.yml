@@ -1,0 +1,44 @@
+name: gitleaks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, Monday 13:00 UTC — catches anything that slipped in.
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      # Pinned so a bad upstream release can't silently change scan behavior.
+      # Dependabot doesn't bump this (not an action) — review gitleaks releases
+      # periodically and bump by hand.
+      GITLEAKS_VERSION: 8.30.0
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0 # full history so a secret in any past commit is caught
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL "$url" -o gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan repository
+        run: gitleaks detect --source . --redact --verbose --config .gitleaks.toml
