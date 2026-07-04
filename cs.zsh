@@ -305,10 +305,11 @@ _cs_rm() {
   echo "cs: removed '$name'."
 }
 
-# Validate each profile's login against the live API and — crucially — flag the
-# failure mode that actually bites: the SAME account logged into more than one
-# credential slot. Because Claude Code rotates refresh tokens, two slots holding
-# one account invalidate each other, causing intermittent forced re-logins.
+# Check each profile's login via `claude auth status --json` (the local CLI's
+# view of each keychain slot) and — crucially — flag the failure mode that
+# actually bites: the SAME account logged into more than one credential slot.
+# Because Claude Code rotates refresh tokens, two slots holding one account
+# invalidate each other, causing intermittent forced re-logins.
 _cs_doctor() {
   if ! command -v claude >/dev/null 2>&1; then
     echo "cs: doctor needs the claude CLI." >&2

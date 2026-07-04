@@ -187,12 +187,21 @@ t_help() {
 t_sha256_matches_claude_scheme() {
   echo "[keychain: service name = sha256(config dir)[:8]]"
   setup
-  # Known vector: sha256("/tmp/x") first 8 hex.
+  # Compute the expected digest with whichever tool _cs_sha256_8 itself uses,
+  # so the test doesn't hard-depend on shasum where only sha256sum exists.
   local expect
-  expect="$(printf '%s' "/tmp/x" | shasum -a 256 | cut -c1-8)"
+  if command -v shasum >/dev/null 2>&1; then
+    expect="$(printf '%s' "/tmp/x" | shasum -a 256 | cut -c1-8)"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    expect="$(printf '%s' "/tmp/x" | sha256sum | cut -c1-8)"
+  else
+    _pass "sha256 tool unavailable — skipped"
+    teardown
+    return
+  fi
   local got
   got="$(_cs_sha256_8 "/tmp/x")"
-  assert_eq "_cs_sha256_8 matches shasum" "$got" "$expect"
+  assert_eq "_cs_sha256_8 matches sha256 tool" "$got" "$expect"
   local svc
   svc="$(_cs_keychain_service "/tmp/x")"
   assert_eq "service name is well-formed" "$svc" "Claude Code-credentials-$expect"
