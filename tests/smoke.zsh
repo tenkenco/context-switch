@@ -124,21 +124,25 @@ if [ "$1" = "auth" ] && [ "$2" = "logout" ]; then
   printf 'FAKE_CLAUDE_LOGOUT\n'
   exit 0
 fi
+# record which overriding auth vars were present at launch so scrub is testable
+printf 'API=%s TOKEN=%s BEDROCK=%s VERTEX=%s\n' "${ANTHROPIC_API_KEY-}" "${CLAUDE_CODE_OAUTH_TOKEN-}" "${CLAUDE_CODE_USE_BEDROCK-}" "${CLAUDE_CODE_USE_VERTEX-}" >"${HOME}/.claude-launch-env"
 printf 'FAKE_CLAUDE: %s\n' "$*"
 SH
   chmod +x "$SANDBOX/bin/claude"
   export PATH="$SANDBOX/bin:$PATH"
 
-  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE 2>/dev/null
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE \
+    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX 2>/dev/null
   unfunction cs claude _cs_validate_name _cs_profiles_root _cs_profile_config_dir \
     _cs_sha256_8 _cs_keychain_service _cs_profile_email _cs_profile_is_set_up \
-    _cs_login _cs_use _cs_off _cs_list _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
+    _cs_build_scrub_args _cs_login _cs_use _cs_off _cs_list _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
   source "$CS_ZSH"
 }
 
 teardown() {
   [[ -n "${SANDBOX:-}" && -d "$SANDBOX" ]] && rm -rf "$SANDBOX"
-  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE SANDBOX 2>/dev/null
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE SANDBOX \
+    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX 2>/dev/null
   PATH="${PATH#*:}"
 }
 
@@ -418,6 +422,37 @@ t_wrapper_refuses_bad_profile() {
   teardown
 }
 
+t_wrapper_scrubs_override_auth_vars() {
+  echo "[wrapper: strips ANTHROPIC_API_KEY / token / bedrock / vertex at launch]"
+  setup
+  seed_profile personal
+  export ANTHROPIC_API_KEY="sk-ant-api-LEAK"
+  export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-LEAK"
+  export CLAUDE_CODE_USE_BEDROCK="1"
+  export CLAUDE_CODE_USE_VERTEX="1"
+  cs use personal >/dev/null 2>&1
+  claude go >/dev/null 2>&1
+  local launched; launched="$(<"$HOME/.claude-launch-env")"
+  assert_eq "launched claude saw no overriding auth vars" "$launched" "API= TOKEN= BEDROCK= VERTEX="
+  # And the user's interactive shell keeps its own API key (not clobbered).
+  assert_eq "shell ANTHROPIC_API_KEY preserved" "${ANTHROPIC_API_KEY:-}" "sk-ant-api-LEAK"
+  teardown
+}
+
+t_doctor_unpinned_does_not_star_default() {
+  echo "[doctor: unpinned shell does not star (default)]"
+  setup
+  seed_profile personal personal@example.com
+  cat >"$HOME/.claude/.claude.json" <<'JSON'
+{"oauthAccount":{"emailAddress":"other@example.com","organizationUuid":"org-default"}}
+JSON
+  unset _CS_PROFILE
+  local out; out="$(cs doctor 2>&1)"
+  assert_contains "default listed" "$out" "(default) — other@example.com"
+  assert_not_contains "default NOT starred when unpinned" "$out" "* (default)"
+  teardown
+}
+
 #------------------------------------------------------------------- run
 
 t_validate_name
@@ -439,6 +474,8 @@ t_doctor_not_logged_in
 t_wrapper_unpinned_passthrough
 t_wrapper_pinned_announces_and_aligns
 t_wrapper_refuses_bad_profile
+t_wrapper_scrubs_override_auth_vars
+t_doctor_unpinned_does_not_star_default
 
 #------------------------------------------------------------------- summary
 

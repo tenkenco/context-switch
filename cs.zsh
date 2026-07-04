@@ -40,6 +40,30 @@ unfunction claude 2>/dev/null
 # Helpers (shared across subcommands).
 #==============================================================================
 
+# Auth env vars that OVERRIDE the profile's keychain login. Claude Code will use
+# any of these in preference to the CLAUDE_CONFIG_DIR credential slot, which
+# would silently authenticate the wrong account (and bill the wrong plan). We
+# strip all of them when launching or inspecting a pinned profile.
+typeset -ga _CS_AUTH_OVERRIDE_VARS=(
+  CLAUDE_CODE_OAUTH_TOKEN
+  ANTHROPIC_API_KEY
+  ANTHROPIC_AUTH_TOKEN
+  CLAUDE_CODE_USE_BEDROCK
+  CLAUDE_CODE_USE_VERTEX
+)
+
+# Populate the global array _cs_scrub with `-u VAR` pairs for env(1), so a
+# caller can run `env "${_cs_scrub[@]}" claude ...` to launch claude without any
+# overriding auth var — without mutating the user's interactive shell.
+typeset -ga _cs_scrub
+_cs_build_scrub_args() {
+  _cs_scrub=()
+  local v
+  for v in "${_CS_AUTH_OVERRIDE_VARS[@]}"; do
+    _cs_scrub+=(-u "$v")
+  done
+}
+
 # Name validation. Allow [A-Za-z0-9._-] but reject leading '.' / '-' and reject
 # any '/' or '..' sequence. Prevents `cs rm ../foo` from escaping profiles/.
 _cs_validate_name() {
@@ -71,7 +95,9 @@ _cs_sha256_8() {
     return 1
   fi
   [[ -n "$s" ]] || return 1
-  printf '%s' "${s[1,8]}"
+  # Use cut rather than a zsh ${s[1,8]} slice: scalar slicing is sensitive to
+  # the user's KSH_ARRAYS option, which would silently shift the range.
+  printf '%s' "$s" | cut -c1-8
 }
 
 # Keychain service name Claude Code uses for a given config dir (macOS).
@@ -99,7 +125,10 @@ _cs_profile_email() {
 _cs_profile_is_set_up() {
   local cfg="$(_cs_profile_config_dir "$1")/.claude.json"
   [[ -f "$cfg" ]] || return 1
-  command -v jq >/dev/null 2>&1 || return 0
+  # Without jq we cannot confirm an oauthAccount was written, so treat the
+  # profile as NOT set up rather than assuming success (a bare .claude.json is
+  # created before login completes). jq is a hard install requirement anyway.
+  command -v jq >/dev/null 2>&1 || return 1
   jq -e '.oauthAccount.emailAddress? // empty' "$cfg" >/dev/null 2>&1
 }
 
@@ -134,8 +163,10 @@ _cs_login() {
   fi
 
   echo "cs: logging into isolated profile '$name' ($cfg_dir)" >&2
-  # Run login in the profile's namespace, without leaking any token env into it.
-  env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR="$cfg_dir" claude auth login "$@" || return $?
+  # Run login in the profile's namespace, without leaking any overriding auth
+  # env (API key, OAuth token, Bedrock/Vertex) into it.
+  _cs_build_scrub_args
+  env "${_cs_scrub[@]}" CLAUDE_CONFIG_DIR="$cfg_dir" claude auth login "$@" || return $?
 
   if ! _cs_profile_is_set_up "$name"; then
     echo "cs: login completed but no oauthAccount was written in $cfg_dir/.claude.json" >&2
@@ -164,10 +195,18 @@ _cs_use() {
 
   export _CS_PROFILE="$name"
   export CLAUDE_CONFIG_DIR="$cfg_dir"
-  # Never carry a stale env token into a config-dir profile — it would override
-  # the isolated keychain login and can 401.
+  # Clear cs's own legacy artifact so it can't override the keychain login.
   unset CLAUDE_CODE_OAUTH_TOKEN
-  mkdir -p "$CLAUDE_CONFIG_DIR"
+
+  # Other overriding auth vars (API key, Bedrock/Vertex) belong to the user's
+  # shell — don't silently unset them, but warn: the `claude` wrapper scrubs
+  # them at launch, and a bare `command claude` would NOT be isolated.
+  local v present=()
+  for v in "${_CS_AUTH_OVERRIDE_VARS[@]}"; do
+    [[ "$v" == CLAUDE_CODE_OAUTH_TOKEN ]] && continue
+    [[ -n "${(P)v:-}" ]] && present+=("$v")
+  done
+  ((${#present})) && echo "cs: note — $present is set; 'claude' will ignore it for this profile (bare 'command claude' would not)." >&2
 
   local email
   email="$(_cs_profile_email "$name")"
@@ -240,13 +279,23 @@ _cs_rm() {
     return 0
   }
 
-  # Remove the keychain credential slot for this config dir (macOS). Loop in
-  # case duplicate items share the service name.
+  # Remove the keychain credential slot(s) for this config dir (macOS). Claude
+  # Code keys the entry by sha256 of the path; try both the literal path and the
+  # symlink-resolved path (${cfg_dir:A}) in case Claude canonicalizes it (e.g. a
+  # symlinked $HOME or /var -> /private/var). Loop per service in case duplicate
+  # items share the name. Warn rather than silently orphan a live credential.
   if command -v security >/dev/null 2>&1; then
-    local svc
-    svc="$(_cs_keychain_service "$cfg_dir")" && [[ -n "$svc" ]] && {
-      while security delete-generic-password -s "$svc" >/dev/null 2>&1; do :; done
-    }
+    local d svc removed=0 leftover=0
+    local -a dirs=("$cfg_dir")
+    [[ "${cfg_dir:A}" != "$cfg_dir" ]] && dirs+=("${cfg_dir:A}")
+    for d in "${dirs[@]}"; do
+      svc="$(_cs_keychain_service "$d")" && [[ -n "$svc" ]] || continue
+      while security delete-generic-password -s "$svc" >/dev/null 2>&1; do removed=1; done
+      security find-generic-password -s "$svc" >/dev/null 2>&1 && leftover=1
+    done
+    if ((leftover)) || { ((! removed)) && security find-generic-password -s "Claude Code-credentials-$(_cs_sha256_8 "$cfg_dir")" >/dev/null 2>&1; }; then
+      echo "cs: warning — a keychain credential for '$name' may remain (Claude Code's naming scheme may have changed). Check with: security dump-keychain | grep 'Claude Code-credentials'" >&2
+    fi
   fi
 
   rm -rf "$cfg_dir"
@@ -274,6 +323,9 @@ _cs_doctor() {
   local label json logged
   local -A email_slots
   root="$(_cs_profiles_root)"
+  # Scrub every overriding auth var so `auth status` reports the profile's real
+  # keychain login, not a stray API key / Bedrock / Vertex identity.
+  _cs_build_scrub_args
 
   # Include the default (unpinned) namespace — it's the most common accidental
   # duplicate. Key "" means "no CLAUDE_CONFIG_DIR".
@@ -286,16 +338,26 @@ _cs_doctor() {
   for name in "${slots[@]}"; do
     if [[ -z "$name" ]]; then
       label="(default)"
-      json="$(env -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CONFIG_DIR claude auth status --json 2>/dev/null)"
+      json="$(env "${_cs_scrub[@]}" -u CLAUDE_CONFIG_DIR claude auth status --json 2>/dev/null)"
     else
       found=1
       label="$name"
-      json="$(env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR="$(_cs_profile_config_dir "$name")" \
+      json="$(env "${_cs_scrub[@]}" CLAUDE_CONFIG_DIR="$(_cs_profile_config_dir "$name")" \
         claude auth status --json 2>/dev/null)"
     fi
+    # Only the pinned profile gets a '*'. Guard against name="" (default slot)
+    # matching an unset _CS_PROFILE, which would falsely star "(default)".
     marker="  "
-    [[ "$name" == "${_CS_PROFILE:-}" ]] && marker="* "
+    [[ -n "$name" && "$name" == "${_CS_PROFILE:-}" ]] && marker="* "
 
+    # Distinguish "CLI said logged out" from "couldn't get a parseable status"
+    # (network blip, rate limit, older CLI) — don't cry "NOT LOGGED IN" on noise.
+    if [[ -z "$json" ]] || ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
+      [[ -z "$name" ]] && continue
+      echo "${marker}${label} — STATUS UNKNOWN (could not query 'claude auth status')"
+      bad=1
+      continue
+    fi
     logged="$(printf '%s' "$json" | jq -r '.loggedIn // false' 2>/dev/null)"
     if [[ "$logged" != "true" ]]; then
       # Default namespace with no login is fine and expected; profiles are not.
@@ -387,6 +449,12 @@ EOF
 #==============================================================================
 
 cs() {
+  # This file is sourced into the user's interactive shell, so isolate option
+  # state: KSH_ARRAYS, SH_WORD_SPLIT, NO_NOMATCH etc. from their ~/.zshrc would
+  # otherwise change how our slicing/array/glob code evaluates. `emulate -L zsh`
+  # (LOCAL_OPTIONS) resets to zsh defaults for this call and every helper it
+  # invokes, and restores on return.
+  emulate -L zsh
   local subcmd="${1:-help}"
   (($# > 0)) && shift
   case "$subcmd" in
@@ -412,7 +480,10 @@ cs() {
 #==============================================================================
 
 claude() {
+  emulate -L zsh
   [[ -n "${_CS_PROFILE:-}" ]] || {
+    # Unpinned: pass through untouched (the user may intentionally be using an
+    # API key or the default login here).
     command claude "$@"
     return
   }
@@ -423,7 +494,11 @@ claude() {
   # Keep the exported config dir consistent with the pin (defends against a
   # shell where _CS_PROFILE and CLAUDE_CONFIG_DIR drifted apart).
   export CLAUDE_CONFIG_DIR="$(_cs_profile_config_dir "$_CS_PROFILE")"
-  unset CLAUDE_CODE_OAUTH_TOKEN
   echo "cs: launching claude as '$_CS_PROFILE' ($(_cs_profile_email "$_CS_PROFILE"))" >&2
-  command claude "$@"
+  # Launch with every overriding auth var stripped, so auth comes ONLY from the
+  # profile's keychain slot — not a stray ANTHROPIC_API_KEY / OAuth token /
+  # Bedrock / Vertex setting. `env … claude` runs the real binary directly,
+  # which also avoids re-entering this wrapper.
+  _cs_build_scrub_args
+  env "${_cs_scrub[@]}" claude "$@"
 }
