@@ -546,8 +546,8 @@ t_login_abort_cleans_up() {
   echo "[login: an aborted login leaves no phantom profile]"
   setup
   local out
-  out="$(CS_TEST_LOGIN_FAIL=1 cs login typo-nmae 2>&1)"
-  assert_dir_absent "no phantom profile dir" "$HOME/.claude/profiles/typo-nmae"
+  out="$(CS_TEST_LOGIN_FAIL=1 cs login aborted-login 2>&1)"
+  assert_dir_absent "no phantom profile dir" "$HOME/.claude/profiles/aborted-login"
   out="$(cs list 2>&1)"
   assert_contains "list stays clean" "$out" "(no profiles"
 
