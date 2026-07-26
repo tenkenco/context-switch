@@ -28,7 +28,10 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 1
 fi
 
-if grep -Fq "$SOURCE_LINE" "$RC_FILE"; then
+# Only an ACTIVE source line counts. Matching the whole file would treat a
+# commented-out line — including the one a user disabled on purpose — as an
+# existing install, so `install.sh` would report success and change nothing.
+if grep -v '^[[:space:]]*#' "$RC_FILE" | grep -Fq "$SOURCE_LINE"; then
   echo "claude-switch: already installed in $RC_FILE — nothing to do."
   exit 0
 fi

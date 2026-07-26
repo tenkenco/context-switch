@@ -30,11 +30,27 @@
 #   - macOS   (security keychain; shasum)
 #   - Linux   (secret storage varies; CLAUDE_CONFIG_DIR isolation still applies)
 
-# Hard-clean stale function definitions so re-sourcing this file actually
-# replaces them (zsh keeps old function bodies otherwise). Intentionally do
-# not clear _CS_PROFILE here: preserving the active profile across re-source
-# keeps reporting/wrapper behavior aligned with the exported config dir.
-unfunction claude 2>/dev/null
+# Re-sourcing this file must replace our own stale definitions (zsh keeps old
+# function bodies otherwise) — but a `claude` function we did NOT define belongs
+# to the user or another plugin, and silently destroying it is data loss. Tell
+# ours apart with a marker, and when a foreign wrapper is present, keep a copy
+# under _cs_prev_claude and say so rather than dropping it on the floor.
+# Intentionally do not clear _CS_PROFILE: preserving the active profile across
+# re-source keeps reporting/wrapper behavior aligned with the exported config dir.
+typeset -g _CS_FOREIGN_CLAUDE=""
+if ((${+functions[claude]})); then
+  if [[ "${_CS_CLAUDE_WRAPPER_OWNED:-}" == "1" ]]; then
+    unfunction claude 2>/dev/null
+  else
+    # Preserve the previous definition so the user can restore or inspect it.
+    # zsh's $functions maps names to bodies; shellcheck reads the subscript as a
+    # variable reference, hence the disable.
+    # shellcheck disable=SC2154
+    functions[_cs_prev_claude]="${functions[claude]}"
+    _CS_FOREIGN_CLAUDE=1
+    unfunction claude 2>/dev/null
+  fi
+fi
 
 #==============================================================================
 # Helpers (shared across subcommands).
@@ -48,8 +64,18 @@ typeset -ga _CS_AUTH_OVERRIDE_VARS=(
   CLAUDE_CODE_OAUTH_TOKEN
   ANTHROPIC_API_KEY
   ANTHROPIC_AUTH_TOKEN
+  ANTHROPIC_CUSTOM_HEADERS
+  AWS_BEARER_TOKEN_BEDROCK
   CLAUDE_CODE_USE_BEDROCK
   CLAUDE_CODE_USE_VERTEX
+)
+
+# Vars we warn about but deliberately do NOT scrub. ANTHROPIC_BASE_URL redirects
+# where requests go rather than who they authenticate as, and users behind a
+# corporate gateway need it to reach the API at all — stripping it would break
+# them. Surface it so a surprising identity isn't silently explained away.
+typeset -ga _CS_AUTH_NOTE_VARS=(
+  ANTHROPIC_BASE_URL
 )
 
 # Populate the global array _cs_scrub with `-u VAR` pairs for env(1), so a
@@ -123,6 +149,11 @@ _cs_profile_email() {
 }
 
 # True if a profile dir has a completed login (config with an oauthAccount).
+#
+# NOTE: this is necessary but NOT sufficient. An older claude-switch cosmetically
+# patched oauthAccount into each profile's .claude.json so `/status` showed the
+# right email, so a profile carried over from that era looks logged in here while
+# having no credential at all. Pair with _cs_profile_has_credential for the truth.
 _cs_profile_is_set_up() {
   local cfg
   cfg="$(_cs_profile_config_dir "$1")/.claude.json"
@@ -132,6 +163,40 @@ _cs_profile_is_set_up() {
   # created before login completes). jq is a hard install requirement anyway.
   command -v jq >/dev/null 2>&1 || return 1
   jq -e '.oauthAccount.emailAddress? // empty' "$cfg" >/dev/null 2>&1
+}
+
+# Is Claude Code's keychain naming scheme still what we think it is? Verified by
+# finding at least one slot for a dir we know about. Without this, a scheme
+# change (or a locked keychain) would make every profile look credential-less
+# and bury the user in false alarms. Memoized per `cs` invocation.
+typeset -g _CS_KC_SCHEME_CACHE=""
+_cs_keychain_scheme_intact() {
+  [[ -n "$_CS_KC_SCHEME_CACHE" ]] && return "$_CS_KC_SCHEME_CACHE"
+  setopt local_options null_glob
+  local d svc rc=1
+  for d in "$(_cs_profiles_root)"/*; do
+    [[ -d "$d" ]] || continue
+    svc="$(_cs_keychain_service "$d")" || continue
+    if security find-generic-password -s "$svc" >/dev/null 2>&1; then
+      rc=0
+      break
+    fi
+  done
+  _CS_KC_SCHEME_CACHE="$rc"
+  return "$rc"
+}
+
+# Does the OS credential store actually hold a login for this profile?
+#   0 = yes, 1 = confirmed missing, 2 = cannot tell (non-macOS, no shasum, or
+#   the scheme/keychain looks unreadable). Callers must treat 2 as "no opinion"
+#   — claiming a profile is broken on a guess is worse than staying quiet.
+_cs_profile_has_credential() {
+  command -v security >/dev/null 2>&1 || return 2
+  local svc
+  svc="$(_cs_keychain_service "$(_cs_profile_config_dir "$1")")" || return 2
+  security find-generic-password -s "$svc" >/dev/null 2>&1 && return 0
+  _cs_keychain_scheme_intact || return 2
+  return 1
 }
 
 # Legacy plaintext credential files from the pre-keychain `cs save` era, kept
@@ -158,6 +223,16 @@ _cs_find_legacy_files() {
 # Subcommand implementations.
 #==============================================================================
 
+# Remove a profile dir that THIS login created and never finished setting up.
+# Never touches a dir that already existed: a failed re-login of a working
+# profile must leave that profile alone.
+_cs_login_cleanup() {
+  local name="$1" cfg_dir="$2" created="$3"
+  ((created)) || return 0
+  _cs_profile_is_set_up "$name" && return 0
+  rm -rf "$cfg_dir"
+}
+
 _cs_login() {
   local name="${1:-}"
   [[ -z "$name" ]] && {
@@ -170,8 +245,13 @@ _cs_login() {
     return 1
   }
 
-  local cfg_dir
+  local cfg_dir created=0
   cfg_dir="$(_cs_profile_config_dir "$name")"
+  # Remember whether this dir is ours to clean up: an aborted or failed login
+  # must not leave a half-made profile behind. One that does shows up in
+  # `cs list` as incomplete, is accepted by `cs use`, and makes `cs doctor`
+  # return 1 on every run until someone notices and removes it by hand.
+  [[ -d "$cfg_dir" ]] || created=1
   mkdir -p "$cfg_dir"
   chmod 700 "$cfg_dir" 2>/dev/null
 
@@ -186,9 +266,23 @@ _cs_login() {
 
   echo "cs: logging into isolated profile '$name' ($cfg_dir)" >&2
   # Run login in the profile's namespace, without leaking any overriding auth
-  # env (API key, OAuth token, Bedrock/Vertex) into it.
+  # env (API key, OAuth token, custom headers, Bedrock/Vertex) into it. The
+  # `always` block runs on error AND on interrupt, so Ctrl-C at the login prompt
+  # cleans up too.
   _cs_build_scrub_args
-  env "${_cs_scrub[@]}" CLAUDE_CONFIG_DIR="$cfg_dir" claude auth login "$@" || return $?
+  # LOCAL_TRAPS keeps this INT handler from leaking into the user's shell; it
+  # covers Ctrl-C at the login prompt, while the rc check below covers a login
+  # that merely fails. (zsh's `{...} always {...}` would express this in one
+  # construct, but shfmt/shellcheck parse this file as bash and cannot read it.)
+  setopt local_options local_traps
+  trap '_cs_login_cleanup "$name" "$cfg_dir" "$created"; return 130' INT
+
+  env "${_cs_scrub[@]}" CLAUDE_CONFIG_DIR="$cfg_dir" claude auth login "$@"
+  local rc=$?
+  if ((rc != 0)); then
+    _cs_login_cleanup "$name" "$cfg_dir" "$created"
+    return "$rc"
+  fi
 
   if ! _cs_profile_is_set_up "$name"; then
     echo "cs: login completed but no oauthAccount was written in $cfg_dir/.claude.json" >&2
@@ -220,24 +314,75 @@ _cs_use() {
   # Clear cs's own legacy artifact so it can't override the keychain login.
   unset CLAUDE_CODE_OAUTH_TOKEN
 
-  # Other overriding auth vars (API key, Bedrock/Vertex) belong to the user's
-  # shell — don't silently unset them, but warn: the `claude` wrapper scrubs
-  # them at launch, and a bare `command claude` would NOT be isolated. Checked
-  # by name (not ${(P)…} indirection) so shfmt/shellcheck can parse this file.
+  # Other overriding auth vars (API key, custom headers, Bedrock/Vertex) belong
+  # to the user's shell — don't silently unset them, but warn: the `claude`
+  # wrapper scrubs them at launch, and a bare `command claude` would NOT be
+  # isolated. Listed by name (not ${(P)…} indirection) so shfmt/shellcheck can
+  # parse this file; keep in sync with _CS_AUTH_OVERRIDE_VARS above.
   local present=()
   [[ -n "${ANTHROPIC_API_KEY:-}" ]] && present+=(ANTHROPIC_API_KEY)
   [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]] && present+=(ANTHROPIC_AUTH_TOKEN)
+  [[ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]] && present+=(ANTHROPIC_CUSTOM_HEADERS)
+  [[ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]] && present+=(AWS_BEARER_TOKEN_BEDROCK)
   [[ -n "${CLAUDE_CODE_USE_BEDROCK:-}" ]] && present+=(CLAUDE_CODE_USE_BEDROCK)
   [[ -n "${CLAUDE_CODE_USE_VERTEX:-}" ]] && present+=(CLAUDE_CODE_USE_VERTEX)
   ((${#present})) && echo "cs: note — ${present[*]} set; 'claude' will ignore it for this profile (bare 'command claude' would not)." >&2
 
-  local email
+  # Not scrubbed (see _CS_AUTH_NOTE_VARS) — flag it so a surprising account or
+  # a failing request isn't a mystery.
+  [[ -n "${ANTHROPIC_BASE_URL:-}" ]] &&
+    echo "cs: note — ANTHROPIC_BASE_URL is set; requests go to it, not the default API (cs does not strip it)." >&2
+
+  local email cred
   email="$(_cs_profile_email "$name")"
   if _cs_profile_is_set_up "$name"; then
-    echo "cs: this shell pinned to '$name' ($email). Run 'claude' to launch."
+    _cs_profile_has_credential "$name"
+    cred=$?
+    if ((cred == 1)); then
+      # The config claims an account but the keychain slot is gone — the classic
+      # leftover from the era when cs patched oauthAccount in cosmetically.
+      echo "cs: this shell pinned to '$name' ($email) — but no credential is stored for it."
+      echo "    Run 'cs login $name' or 'claude' will just prompt you to log in." >&2
+    else
+      echo "cs: this shell pinned to '$name' ($email). Run 'claude' to launch."
+    fi
   else
     echo "cs: this shell pinned to '$name' (not logged in yet — run: cs login $name)."
   fi
+}
+
+# Run claude under a profile without pinning the shell and without going through
+# the `claude` wrapper — `env` executes the real binary, so a `claude` function
+# from another plugin is neither consulted nor clobbered. This is the escape
+# hatch for anyone who would rather claude-switch not own the `claude` name.
+_cs_run() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && {
+    echo "cs run <name> [--] [claude args...]" >&2
+    return 1
+  }
+  _cs_validate_name "$name" || {
+    echo "cs: invalid profile name '$name'" >&2
+    return 1
+  }
+  shift
+  [[ "${1:-}" == "--" ]] && shift
+
+  local cfg_dir
+  cfg_dir="$(_cs_profile_config_dir "$name")"
+  [[ -d "$cfg_dir" ]] || {
+    echo "cs: profile '$name' is not set up. Run: cs login $name" >&2
+    return 1
+  }
+  # $commands, not `command -v`: after this file is sourced, `command -v claude`
+  # matches our own shell function and would claim the CLI is installed when it
+  # is not.
+  [[ -n "${commands[claude]:-}" ]] || {
+    echo "cs: the claude CLI is not installed (or not in PATH)." >&2
+    return 1
+  }
+  _cs_build_scrub_args
+  env "${_cs_scrub[@]}" CLAUDE_CONFIG_DIR="$cfg_dir" claude "$@"
 }
 
 _cs_off() {
@@ -247,7 +392,7 @@ _cs_off() {
 
 _cs_list() {
   setopt local_options null_glob
-  local root f name marker email found=0
+  local root f name marker email found=0 cred=0
   root="$(_cs_profiles_root)"
   for f in "$root"/*; do
     [[ -d "$f" ]] || continue
@@ -257,7 +402,15 @@ _cs_list() {
     [[ "$name" == "${_CS_PROFILE:-}" ]] && marker="* "
     if _cs_profile_is_set_up "$name"; then
       email="$(_cs_profile_email "$name")"
-      echo "${marker}${name} — ${email}"
+      # Only contradict the config when we positively confirmed the credential
+      # is gone (rc 1); rc 2 means "couldn't check" and stays silent.
+      _cs_profile_has_credential "$name"
+      cred=$?
+      if ((cred == 1)); then
+        echo "${marker}${name} — ${email} (no credential — run: cs login $name)"
+      else
+        echo "${marker}${name} — ${email}"
+      fi
     else
       echo "${marker}${name} — incomplete (run: cs login $name)"
     fi
@@ -320,17 +473,35 @@ _cs_rm() {
   # symlinked $HOME or /var -> /private/var). Loop per service in case duplicate
   # items share the name. Warn rather than silently orphan a live credential.
   if command -v security >/dev/null 2>&1; then
-    local d svc removed=0 leftover=0
+    local d svc had_before=0 leftover=0 probed=0
     local -a dirs=("$cfg_dir")
     [[ "${cfg_dir:A}" != "$cfg_dir" ]] && dirs+=("${cfg_dir:A}")
     for d in "${dirs[@]}"; do
       svc="$(_cs_keychain_service "$d")"
       [[ -n "$svc" ]] || continue
-      while security delete-generic-password -s "$svc" >/dev/null 2>&1; do removed=1; done
+      probed=1
+      # Probe BEFORE deleting. Inferring "no credential" from a find that failed
+      # is wrong: a locked keychain (or a denied access prompt) fails both the
+      # delete and the find, which used to read as "nothing was there" and left
+      # a live credential orphaned without a word.
+      security find-generic-password -s "$svc" >/dev/null 2>&1 && had_before=1
+      while security delete-generic-password -s "$svc" >/dev/null 2>&1; do :; done
       security find-generic-password -s "$svc" >/dev/null 2>&1 && leftover=1
     done
-    if ((leftover)) || { ((!removed)) && security find-generic-password -s "Claude Code-credentials-$(_cs_sha256_8 "$cfg_dir")" >/dev/null 2>&1; }; then
-      echo "cs: warning — a keychain credential for '$name' may remain (Claude Code's naming scheme may have changed). Check with: security dump-keychain | grep 'Claude Code-credentials'" >&2
+    if ((leftover)); then
+      echo "cs: warning — the keychain credential for '$name' is STILL PRESENT after deletion." >&2
+      echo "    Remove it by hand: security delete-generic-password -s '$svc'" >&2
+    elif ((!probed)); then
+      # No sha256 tool, so we never derived a service name to look for.
+      echo "cs: warning — could not derive the keychain service name for '$name'; a credential may remain." >&2
+      echo "    Check with: security dump-keychain | grep 'Claude Code-credentials'" >&2
+    elif ((!had_before)) && ! _cs_keychain_scheme_intact; then
+      # Found nothing to delete AND no other profile has a slot either — more
+      # likely the keychain is unreadable or the scheme moved than that this
+      # profile genuinely had no credential.
+      echo "cs: note — no keychain credential was found for '$name'. If you expected one," >&2
+      echo "    Claude Code's naming scheme may have changed; check with:" >&2
+      echo "    security dump-keychain | grep 'Claude Code-credentials'" >&2
     fi
   fi
 
@@ -360,8 +531,11 @@ _cs_rm() {
 # Because Claude Code rotates refresh tokens, two slots holding one account
 # invalidate each other, causing intermittent forced re-logins.
 _cs_doctor() {
-  if ! command -v claude >/dev/null 2>&1; then
-    echo "cs: doctor needs the claude CLI." >&2
+  # $commands[claude] is the real binary. `command -v claude` would match the
+  # `claude` shell function this file defines and pass even with no CLI present,
+  # which then surfaced as every profile reporting STATUS UNKNOWN.
+  if [[ -z "${commands[claude]:-}" ]]; then
+    echo "cs: doctor needs the claude CLI (not found in PATH)." >&2
     return 1
   fi
   if ! command -v jq >/dev/null 2>&1; then
@@ -466,6 +640,10 @@ Usage:
   cs login <name> [claude auth login args...]
                     Log a full claude.ai account into an isolated profile.
   cs use <name>     Pin THIS shell to a profile (exports CLAUDE_CONFIG_DIR).
+  cs run <name> [--] [args...]
+                    Run claude once under a profile without pinning the shell.
+                    Bypasses the `claude` wrapper entirely, so it is also the
+                    way to coexist with another plugin's `claude` function.
   cs off            Unpin this shell (claude falls back to the default config).
   cs list           List profiles; * marks the one pinned in this shell.
   cs doctor         Check each profile's login AND flag any account that is
@@ -510,11 +688,15 @@ cs() {
   # (LOCAL_OPTIONS) resets to zsh defaults for this call and every helper it
   # invokes, and restores on return.
   emulate -L zsh
+  # Keychain probes are memoized per invocation, not per shell: a login or
+  # removal between two `cs` calls must not be masked by a stale answer.
+  _CS_KC_SCHEME_CACHE=""
   local subcmd="${1:-help}"
   (($# > 0)) && shift
   case "$subcmd" in
   login) _cs_login "$@" ;;
   use) _cs_use "$@" ;;
+  run) _cs_run "$@" ;;
   off) _cs_off "$@" ;;
   list | ls) _cs_list "$@" ;;
   doctor | check) _cs_doctor "$@" ;;
@@ -559,3 +741,25 @@ claude() {
   _cs_build_scrub_args
   env "${_cs_scrub[@]}" claude "$@"
 }
+# Mark the wrapper as ours so a later re-source can tell it from a foreign one.
+typeset -g _CS_CLAUDE_WRAPPER_OWNED=1
+
+#==============================================================================
+# Source-time diagnostics. Printed once per shell, to stderr, so they never
+# pollute a `cs list` or `cs current` someone is parsing.
+#==============================================================================
+
+if [[ -n "$_CS_FOREIGN_CLAUDE" ]]; then
+  echo "cs: note — a 'claude' function was already defined in this shell; claude-switch" >&2
+  echo "    replaced it with its profile-aware wrapper. The previous definition is kept" >&2
+  echo "    as '_cs_prev_claude' (restore with: functions[claude]=\$functions[_cs_prev_claude])." >&2
+  echo "    To leave the 'claude' name alone entirely, use: cs run <name> -- <args>" >&2
+fi
+
+# jq is a hard requirement of install.sh, but plugin managers (zinit, oh-my-zsh,
+# sheldon, antidote) source this file directly and never run the installer.
+# Without jq every profile silently reports as 'incomplete' even when it works.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "cs: warning — 'jq' not found in PATH. Profile status will read as 'incomplete'" >&2
+  echo "    and 'cs doctor' will not run. Install jq (brew install jq / apt install jq)." >&2
+fi

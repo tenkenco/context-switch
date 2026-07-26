@@ -95,6 +95,8 @@ setup() {
   cat >"$SANDBOX/bin/claude" <<'SH'
 #!/bin/sh
 if [ "$1" = "auth" ] && [ "$2" = "login" ]; then
+  # Simulate a failed / Ctrl-C'd login: exit non-zero writing no config.
+  [ -n "${CS_TEST_LOGIN_FAIL-}" ] && exit 130
   [ -n "${CLAUDE_CODE_OAUTH_TOKEN-}" ] && printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" >"${HOME}/.auth-login-token-env"
   all="$*"
   email="login@example.com"
@@ -133,11 +135,13 @@ SH
 
   unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE \
     ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX 2>/dev/null
-  unfunction cs claude _cs_validate_name _cs_profiles_root _cs_profile_config_dir \
-    _cs_sha256_8 _cs_keychain_service _cs_profile_email _cs_profile_is_set_up \
-    _cs_build_scrub_args _cs_find_legacy_files _cs_login _cs_use _cs_off _cs_list \
-    _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
-  source "$CS_ZSH"
+  unfunction cs claude _cs_prev_claude _cs_validate_name _cs_profiles_root \
+    _cs_profile_config_dir _cs_sha256_8 _cs_keychain_service _cs_profile_email \
+    _cs_profile_is_set_up _cs_profile_has_credential _cs_keychain_scheme_intact \
+    _cs_build_scrub_args _cs_find_legacy_files _cs_login _cs_use _cs_run _cs_off \
+    _cs_list _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
+  _CS_KC_SCHEME_CACHE=""
+  source "$CS_ZSH" 2>/dev/null
 }
 
 teardown() {
@@ -155,6 +159,44 @@ seed_profile() {
   cat >"$cfg_dir/.claude.json" <<JSON
 {"oauthAccount":{"emailAddress":"$email","organizationUuid":"org-$name"}}
 JSON
+}
+
+# Install a fake `security` that reports exactly the service names listed in
+# $HOME/.kc-present (one per line). Shadows the real macOS binary because the
+# sandbox bin comes first on PATH, so these tests behave identically on Linux.
+fake_security() {
+  : >"$HOME/.kc-present"
+  cat >"$SANDBOX/bin/security" <<'SH'
+#!/bin/sh
+# usage: security {find,delete}-generic-password -s <service>
+cmd="$1"; shift
+svc=""
+while [ $# -gt 0 ]; do
+  [ "$1" = "-s" ] && { svc="$2"; shift; }
+  shift
+done
+case "$cmd" in
+  find-generic-password)
+    grep -Fxq "$svc" "$HOME/.kc-present" 2>/dev/null && exit 0
+    exit 44 ;;
+  delete-generic-password)
+    if grep -Fxq "$svc" "$HOME/.kc-present" 2>/dev/null; then
+      grep -Fxv "$svc" "$HOME/.kc-present" >"$HOME/.kc-present.tmp" 2>/dev/null
+      mv "$HOME/.kc-present.tmp" "$HOME/.kc-present"
+      exit 0
+    fi
+    exit 44 ;;
+esac
+exit 1
+SH
+  chmod +x "$SANDBOX/bin/security"
+}
+
+# Mark a profile as having a stored credential, using the same service name
+# cs.zsh derives, so the test binds to the real hashing scheme.
+kc_add_profile() {
+  _cs_keychain_service "$HOME/.claude/profiles/$1" >>"$HOME/.kc-present"
+  echo >>"$HOME/.kc-present"
 }
 
 # Create the plaintext credential files a pre-keychain `cs save` left behind.
@@ -398,6 +440,156 @@ t_rm_legacy_credentials() {
   teardown
 }
 
+t_foreign_claude_function_preserved() {
+  echo "[wrapper: a pre-existing 'claude' function is preserved, not destroyed]"
+  setup
+  # Simulate another plugin (or the user's zshrc) owning `claude`, then re-source
+  # as a fresh install would: _CS_CLAUDE_WRAPPER_OWNED unset means "not ours".
+  unset _CS_CLAUDE_WRAPPER_OWNED
+  unfunction claude _cs_prev_claude 2>/dev/null
+  claude() { echo "OTHER_PLUGIN_WRAPPER"; }
+  # Source in THIS shell (not a $( ) subshell) so the function stash and the
+  # ownership marker actually persist; capture stderr via a file instead.
+  local out err="$HOME/.src-err"
+  source "$CS_ZSH" 2>"$err" >/dev/null
+  out="$(cat "$err")"
+  assert_contains "warns about the collision" "$out" "'claude' function was already defined"
+  assert_contains "names the escape hatch" "$out" "cs run"
+  local prev
+  prev="$(_cs_prev_claude 2>&1)"
+  assert_eq "previous definition preserved" "$prev" "OTHER_PLUGIN_WRAPPER"
+
+  # Re-sourcing over our OWN wrapper must not warn or stash again.
+  unfunction _cs_prev_claude 2>/dev/null
+  source "$CS_ZSH" 2>"$err" >/dev/null
+  out="$(cat "$err")"
+  assert_not_contains "no warning when replacing our own wrapper" "$out" "already defined"
+  teardown
+}
+
+t_run_subcommand() {
+  echo "[run: one-shot profile launch that bypasses the wrapper]"
+  setup
+  seed_profile personal
+  local out
+  out="$(cs run personal -- --version 2>&1)"
+  assert_contains "invokes the real binary" "$out" "FAKE_CLAUDE: --version"
+  assert_eq "shell not pinned by run" "${_CS_PROFILE:-_NONE_}" "_NONE_"
+  assert_eq "config dir not exported by run" "${CLAUDE_CONFIG_DIR:-_NONE_}" "_NONE_"
+
+  # Args should reach claude without the '--' being required.
+  out="$(cs run personal --version 2>&1)"
+  assert_contains "'--' is optional" "$out" "FAKE_CLAUDE: --version"
+
+  out="$(cs run ../evil 2>&1)"
+  assert_contains "validates the name" "$out" "invalid profile name"
+  out="$(cs run ghost 2>&1)"
+  assert_contains "rejects unknown profile" "$out" "is not set up"
+
+  # It must ignore a foreign `claude` function entirely.
+  claude() { echo "SHOULD_NOT_RUN"; }
+  out="$(cs run personal -- hi 2>&1)"
+  assert_not_contains "does not call a shell function" "$out" "SHOULD_NOT_RUN"
+  teardown
+}
+
+t_doctor_needs_real_binary() {
+  echo "[doctor: detects a missing CLI even though cs defines claude()]"
+  setup
+  seed_profile personal
+  # Drop the fake binary AND narrow PATH: the developer running these tests very
+  # likely has a real claude installed, which would otherwise still be found.
+  local saved_path="$PATH"
+  rm -f "$SANDBOX/bin/claude"
+  PATH="$SANDBOX/bin:/usr/bin:/bin"
+  hash -r 2>/dev/null
+  local out rc
+  out="$(cs doctor 2>&1)"
+  rc=$?
+  PATH="$saved_path"
+  hash -r 2>/dev/null
+  assert_contains "reports the CLI as missing" "$out" "needs the claude CLI"
+  assert_eq "exits non-zero" "$rc" "1"
+  teardown
+}
+
+t_credential_missing_is_reported() {
+  echo "[list/use: config says logged in but no credential is stored]"
+  setup
+  fake_security
+  seed_profile personal
+  seed_profile work
+  # 'work' has a real slot; 'personal' does not — the legacy-upgrade shape,
+  # where an older cs patched oauthAccount in cosmetically.
+  kc_add_profile work
+
+  local out
+  out="$(cs list 2>&1)"
+  assert_contains "flags the credential-less profile" "$out" "personal — personal@example.com (no credential"
+  assert_not_contains "leaves the healthy profile alone" "$out" "work — work@example.com (no credential"
+
+  out="$(cs use personal 2>&1)"
+  assert_contains "cs use warns too" "$out" "no credential is stored"
+  out="$(cs use work 2>&1)"
+  assert_contains "healthy profile pins normally" "$out" "Run 'claude' to launch"
+
+  # When NO profile has a slot we cannot distinguish "scheme changed" from
+  # "genuinely missing", so cs must stay quiet rather than cry wolf.
+  : >"$HOME/.kc-present"
+  _CS_KC_SCHEME_CACHE=""
+  out="$(cs list 2>&1)"
+  assert_not_contains "silent when the scheme looks unreadable" "$out" "no credential"
+  teardown
+}
+
+t_login_abort_cleans_up() {
+  echo "[login: an aborted login leaves no phantom profile]"
+  setup
+  local out
+  out="$(CS_TEST_LOGIN_FAIL=1 cs login typo-nmae 2>&1)"
+  assert_dir_absent "no phantom profile dir" "$HOME/.claude/profiles/typo-nmae"
+  out="$(cs list 2>&1)"
+  assert_contains "list stays clean" "$out" "(no profiles"
+
+  # An existing, already-working profile must survive a failed re-login.
+  seed_profile personal
+  CS_TEST_LOGIN_FAIL=1 cs login personal >/dev/null 2>&1
+  assert_file_exists "existing profile untouched" "$HOME/.claude/profiles/personal/.claude.json"
+  teardown
+}
+
+t_installer() {
+  echo "[install.sh: idempotency and commented-out source lines]"
+  setup
+  local rc_file="$HOME/.zshrc" out
+  : >"$rc_file"
+
+  out="$(bash "$REPO_DIR/install.sh" 2>&1)"
+  assert_contains "reports install" "$out" "installed"
+  local n
+  n="$(grep -c "source \"$REPO_DIR/cs.zsh\"" "$rc_file")"
+  assert_eq "source line written once" "$n" "1"
+
+  out="$(bash "$REPO_DIR/install.sh" 2>&1)"
+  assert_contains "second run is a no-op" "$out" "already installed"
+  n="$(grep -c "source \"$REPO_DIR/cs.zsh\"" "$rc_file")"
+  assert_eq "still only one source line" "$n" "1"
+
+  # A commented-out line is NOT an installation. This used to report
+  # "already installed" and change nothing, leaving cs unloadable.
+  printf '# source "%s/cs.zsh"\n' "$REPO_DIR" >"$rc_file"
+  out="$(bash "$REPO_DIR/install.sh" 2>&1)"
+  assert_not_contains "commented line is not an install" "$out" "already installed"
+  n="$(grep -c "^source \"$REPO_DIR/cs.zsh\"" "$rc_file")"
+  assert_eq "active line added" "$n" "1"
+
+  # Indented comments too.
+  printf '   #   source "%s/cs.zsh"\n' "$REPO_DIR" >"$rc_file"
+  out="$(bash "$REPO_DIR/install.sh" 2>&1)"
+  assert_not_contains "indented comment is not an install" "$out" "already installed"
+  teardown
+}
+
 t_rm_pinned_clears_env() {
   echo "[rm: removing pinned profile clears env]"
   setup
@@ -555,6 +747,12 @@ t_wrapper_pinned_announces_and_aligns
 t_wrapper_refuses_bad_profile
 t_wrapper_scrubs_override_auth_vars
 t_doctor_unpinned_does_not_star_default
+t_foreign_claude_function_preserved
+t_run_subcommand
+t_doctor_needs_real_binary
+t_credential_missing_is_reported
+t_login_abort_cleans_up
+t_installer
 
 #------------------------------------------------------------------- summary
 
