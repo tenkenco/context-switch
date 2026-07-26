@@ -150,7 +150,8 @@ SH
   unfunction cs claude _cs_prev_claude _cs_validate_name _cs_profiles_root \
     _cs_profile_config_dir _cs_sha256_8 _cs_keychain_service _cs_profile_email \
     _cs_profile_is_set_up _cs_profile_has_credential _cs_keychain_scheme_intact \
-    _cs_build_scrub_args _cs_find_legacy_files _cs_login _cs_use _cs_run _cs_off \
+    _cs_build_scrub_args _cs_find_legacy_files _cs_warn_note_vars \
+    _cs_source_diagnostics _cs_login _cs_login_cleanup _cs_use _cs_run _cs_off \
     _cs_list _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
   _CS_KC_SCHEME_CACHE=""
   source "$CS_ZSH" 2>/dev/null
@@ -581,13 +582,20 @@ t_login_abort_cleans_up() {
   echo "[login: an aborted login leaves no phantom profile]"
   setup
   local out
+  local rc
   out="$(CS_TEST_LOGIN_FAIL=1 cs login aborted-login 2>&1)"
+  rc=$?
   assert_dir_absent "no phantom profile dir" "$HOME/.claude/profiles/aborted-login"
+  # An aborted login must not look successful to `cs login x && ...`.
+  assert_not_eq "aborted login does not return 0" "$rc" "0"
+  assert_eq "aborted login propagates the failure code" "$rc" "130"
   out="$(cs list 2>&1)"
   assert_contains "list stays clean" "$out" "(no profiles"
 
   out="$(CS_TEST_LOGIN_EMPTY=1 cs login empty-login 2>&1)"
+  rc=$?
   assert_contains "empty successful login is rejected" "$out" "no oauthAccount"
+  assert_not_eq "empty login does not return 0" "$rc" "0"
   assert_dir_absent "empty successful login is cleaned up" \
     "$HOME/.claude/profiles/empty-login"
 
@@ -595,6 +603,65 @@ t_login_abort_cleans_up() {
   seed_profile personal
   CS_TEST_LOGIN_FAIL=1 cs login personal >/dev/null 2>&1
   assert_file_exists "existing profile untouched" "$HOME/.claude/profiles/personal/.claude.json"
+  teardown
+}
+
+t_foreign_claude_unsaved_is_reported_honestly() {
+  echo "[wrapper: an unpreservable foreign function is reported as LOST, not kept]"
+  setup
+  # The 'unsaved' branch fires only where `functions -c` is unavailable, which
+  # we cannot produce on a supported zsh — drive the diagnostics directly so
+  # both branches are covered rather than assumed.
+  local out err="$HOME/.diag-err"
+  _CS_FOREIGN_CLAUDE=unsaved
+  _cs_source_diagnostics 2>"$err" >/dev/null
+  out="$(cat "$err")"
+  assert_contains "says it could not preserve" "$out" "NOT be preserved"
+  assert_contains "says the definition is lost" "$out" "LOST"
+  assert_not_contains "does not claim a backup exists" "$out" "is kept"
+  assert_not_contains "does not offer a bogus restore command" "$out" "_cs_prev_claude]"
+
+  # The 'saved' branch must still promise a backup.
+  _CS_FOREIGN_CLAUDE=saved
+  _cs_source_diagnostics 2>"$err" >/dev/null
+  out="$(cat "$err")"
+  assert_contains "saved branch promises the copy" "$out" "kept"
+  assert_contains "saved branch names the restore command" "$out" "_cs_prev_claude"
+
+  # Real data loss is never silenced by CS_QUIET; the advisory is.
+  unfunction claude _cs_prev_claude 2>/dev/null
+  claude() { echo "OTHER_PLUGIN_WRAPPER"; }
+  CS_QUIET=1 source "$CS_ZSH" 2>"$err" >/dev/null
+  out="$(cat "$err")"
+  assert_not_contains "CS_QUIET silences the advisory" "$out" "already defined"
+  assert_eq "but the function is still preserved" "$(_cs_prev_claude 2>&1)" "OTHER_PLUGIN_WRAPPER"
+  teardown
+}
+
+t_base_url_warned_on_every_launch_path() {
+  echo "[base-url: warned wherever claude is launched, not just cs use]"
+  setup
+  seed_profile personal
+  export ANTHROPIC_BASE_URL="https://gateway.example.invalid"
+  local out
+  out="$(cs use personal 2>&1)"
+  assert_contains "cs use warns" "$out" "ANTHROPIC_BASE_URL is set"
+  out="$(cs run personal -- hi 2>&1)"
+  assert_contains "cs run warns" "$out" "ANTHROPIC_BASE_URL is set"
+  # Pin in THIS shell (not a $( ) subshell) so the wrapper sees _CS_PROFILE and
+  # takes the pinned branch rather than the unpinned passthrough.
+  cs use personal >/dev/null 2>&1
+  out="$(claude hi 2>&1)"
+  assert_contains "the claude wrapper warns" "$out" "ANTHROPIC_BASE_URL is set"
+
+  # It is a note, not a block: the launch still happens, and the var survives.
+  assert_contains "launch still proceeds" "$out" "FAKE_CLAUDE: hi"
+  assert_eq "base url not stripped from the shell" "$ANTHROPIC_BASE_URL" \
+    "https://gateway.example.invalid"
+
+  unset ANTHROPIC_BASE_URL
+  out="$(cs run personal -- hi 2>&1)"
+  assert_not_contains "silent when unset" "$out" "ANTHROPIC_BASE_URL"
   teardown
 }
 
@@ -811,6 +878,8 @@ t_wrapper_refuses_bad_profile
 t_wrapper_scrubs_override_auth_vars
 t_doctor_unpinned_does_not_star_default
 t_foreign_claude_function_preserved
+t_foreign_claude_unsaved_is_reported_honestly
+t_base_url_warned_on_every_launch_path
 t_run_subcommand
 t_doctor_needs_real_binary
 t_credential_missing_is_reported

@@ -131,6 +131,16 @@ To leave the `claude` name alone after sourcing, restore the previous definition
 cs run work -- --version
 ```
 
+Once you've made that choice, silence the per-shell notice with:
+
+```sh
+export CS_QUIET=1
+```
+
+`CS_QUIET` suppresses the advisory notices only. If claude-switch ever replaces a `claude` function it could **not** preserve, it still says so — that's data loss, not an advisory.
+
+> **Note on `ANTHROPIC_BASE_URL`.** claude-switch strips overriding auth variables so the *identity* comes only from the profile's keychain slot, but it deliberately does not strip `ANTHROPIC_BASE_URL` — you may need it to reach the API at all. It controls *where* requests go, so the profile's token is sent to whatever endpoint it names. Every command that launches Claude warns when it is set.
+
 ## Notes
 
 - ✅ `cs login` profiles use Claude Code's full `claude.ai` login in an isolated config directory (keychain-backed, per `CLAUDE_CONFIG_DIR`).

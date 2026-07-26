@@ -48,9 +48,15 @@ if typeset -f claude >/dev/null 2>&1; then
   if [[ "$(typeset -f claude)" == *"_CS_CLAUDE_SWITCH_WRAPPER"* ]]; then
     unfunction claude 2>/dev/null
   else
-    # Preserve the previous definition so the user can restore or inspect it.
-    functions -c claude _cs_prev_claude 2>/dev/null
-    _CS_FOREIGN_CLAUDE=1
+    # Preserve the previous definition so the user can restore or inspect it —
+    # but only CLAIM preservation if the copy actually succeeded. Announcing a
+    # backup that does not exist is worse than announcing none: the user stops
+    # looking for the function we just removed.
+    if functions -c claude _cs_prev_claude 2>/dev/null; then
+      _CS_FOREIGN_CLAUDE=saved
+    else
+      _CS_FOREIGN_CLAUDE=unsaved
+    fi
     unfunction claude 2>/dev/null
   fi
 fi
@@ -73,13 +79,26 @@ typeset -ga _CS_AUTH_OVERRIDE_VARS=(
   CLAUDE_CODE_USE_VERTEX
 )
 
-# Vars we warn about but deliberately do NOT scrub. ANTHROPIC_BASE_URL redirects
+# Vars we warn about but deliberately do NOT scrub. ANTHROPIC_BASE_URL selects
 # where requests go rather than who they authenticate as, and users behind a
 # corporate gateway need it to reach the API at all — stripping it would break
-# them. Surface it so a surprising identity isn't silently explained away.
+# them at the one moment it matters.
+#
+# Be honest about what that costs: scrubbing controls WHICH IDENTITY is used,
+# not WHERE the request (and therefore the profile's bearer token) is sent. A
+# BASE_URL pointing somewhere unexpected still receives that token. So every
+# path that launches claude warns, not just `cs use`.
 typeset -ga _CS_AUTH_NOTE_VARS=(
   ANTHROPIC_BASE_URL
 )
+
+# Print the not-scrubbed warning. Called from every launch path so the notice
+# cannot be missed by whichever entry point the user happens to prefer.
+_cs_warn_note_vars() {
+  [[ -n "${ANTHROPIC_BASE_URL:-}" ]] || return 0
+  echo "cs: note — ANTHROPIC_BASE_URL is set; this profile's token is sent to" >&2
+  echo "    $ANTHROPIC_BASE_URL, not the default API endpoint (cs does not strip it)." >&2
+}
 
 # Populate the global array _cs_scrub with `-u VAR` pairs for env(1), so a
 # caller can run `env "${_cs_scrub[@]}" claude ...` to launch claude without any
@@ -278,10 +297,16 @@ _cs_login() {
   # that merely fails. (zsh's `{...} always {...}` would express this in one
   # construct, but shfmt/shellcheck parse this file as bash and cannot read it.)
   setopt local_options local_traps
-  trap '_cs_login_cleanup "$name" "$cfg_dir" "$created"; return 130' INT
+  local interrupted=0
+  trap 'interrupted=1' INT
 
   env "${_cs_scrub[@]}" CLAUDE_CONFIG_DIR="$cfg_dir" claude auth login "$@"
   local rc=$?
+  # After zsh runs an INT handler, $? no longer reflects the interrupted
+  # command, so the flag — not rc — is what proves Ctrl-C happened. Returning
+  # from inside the trap instead would exit with 0, making an aborted login
+  # look successful to `cs login x && …`.
+  ((interrupted)) && rc=130
   if ((rc != 0)); then
     _cs_login_cleanup "$name" "$cfg_dir" "$created"
     return "$rc"
@@ -332,10 +357,7 @@ _cs_use() {
   [[ -n "${CLAUDE_CODE_USE_VERTEX:-}" ]] && present+=(CLAUDE_CODE_USE_VERTEX)
   ((${#present})) && echo "cs: note — ${present[*]} set; 'claude' will ignore it for this profile (bare 'command claude' would not)." >&2
 
-  # Not scrubbed (see _CS_AUTH_NOTE_VARS) — flag it so a surprising account or
-  # a failing request isn't a mystery.
-  [[ -n "${ANTHROPIC_BASE_URL:-}" ]] &&
-    echo "cs: note — ANTHROPIC_BASE_URL is set; requests go to it, not the default API (cs does not strip it)." >&2
+  _cs_warn_note_vars
 
   local email cred
   email="$(_cs_profile_email "$name")"
@@ -385,6 +407,7 @@ _cs_run() {
     echo "cs: the claude CLI is not installed (or not in PATH)." >&2
     return 1
   }
+  _cs_warn_note_vars
   _cs_build_scrub_args
   # Keep the child environment internally consistent when the calling shell is
   # already pinned to another profile. Nested shells inherit both variables.
@@ -745,30 +768,50 @@ claude() {
   cfg_dir="$(_cs_profile_config_dir "$_CS_PROFILE")"
   export CLAUDE_CONFIG_DIR="$cfg_dir"
   echo "cs: launching claude as '$_CS_PROFILE' ($(_cs_profile_email "$_CS_PROFILE"))" >&2
-  # Launch with every overriding auth var stripped, so auth comes ONLY from the
-  # profile's keychain slot — not a stray ANTHROPIC_API_KEY / OAuth token /
-  # Bedrock / Vertex setting. `env … claude` runs the real binary directly,
-  # which also avoids re-entering this wrapper.
+  # Launch with every overriding auth var stripped, so the IDENTITY comes only
+  # from the profile's keychain slot — not a stray ANTHROPIC_API_KEY / OAuth
+  # token / custom headers / Bedrock / Vertex setting. This does not control
+  # where the request goes: ANTHROPIC_BASE_URL is deliberately left intact
+  # (see _CS_AUTH_NOTE_VARS), hence the warning. `env … claude` runs the real
+  # binary directly, which also avoids re-entering this wrapper.
+  _cs_warn_note_vars
   _cs_build_scrub_args
   env "${_cs_scrub[@]}" claude "$@"
 }
 
 #==============================================================================
 # Source-time diagnostics. Printed once per shell, to stderr, so they never
-# pollute a `cs list` or `cs current` someone is parsing.
+# pollute a `cs list` or `cs current` someone is parsing. Kept in a function so
+# both branches are reachable from the tests.
 #==============================================================================
 
-if [[ -n "$_CS_FOREIGN_CLAUDE" ]]; then
-  echo "cs: note — a 'claude' function was already defined in this shell; claude-switch" >&2
-  echo "    replaced it with its profile-aware wrapper. The previous definition is kept" >&2
-  echo "    as '_cs_prev_claude' (restore with: functions[claude]=\$functions[_cs_prev_claude])." >&2
-  echo "    To leave the 'claude' name alone entirely, use: cs run <name> -- <args>" >&2
-fi
+_cs_source_diagnostics() {
+  if [[ "$_CS_FOREIGN_CLAUDE" == "saved" ]]; then
+    echo "cs: note — a 'claude' function was already defined in this shell; claude-switch" >&2
+    echo "    replaced it with its profile-aware wrapper. The previous definition is kept" >&2
+    echo "    as '_cs_prev_claude' (restore with: functions[claude]=\$functions[_cs_prev_claude])." >&2
+    echo "    To bypass the wrapper entirely, use: cs run <name> -- <args>" >&2
+    echo "    Silence this notice with: export CS_QUIET=1" >&2
+  elif [[ "$_CS_FOREIGN_CLAUDE" == "unsaved" ]]; then
+    # We removed their function and could NOT keep a copy. Say exactly that.
+    echo "cs: WARNING — a 'claude' function was already defined in this shell and could" >&2
+    echo "    NOT be preserved (this zsh does not support 'functions -c'). It has been" >&2
+    echo "    REPLACED and the previous definition is LOST for this shell. Re-open a" >&2
+    echo "    shell without sourcing claude-switch to get it back." >&2
+  fi
 
-# jq is a hard requirement of install.sh, but plugin managers (zinit, oh-my-zsh,
-# sheldon, antidote) source this file directly and never run the installer.
-# Without jq every profile silently reports as 'incomplete' even when it works.
-if ! command -v jq >/dev/null 2>&1; then
-  echo "cs: warning — 'jq' not found in PATH. Profile status will read as 'incomplete'" >&2
-  echo "    and 'cs doctor' will not run. Install jq (brew install jq / apt install jq)." >&2
+  # jq is a hard requirement of install.sh, but plugin managers (zinit, oh-my-zsh,
+  # sheldon, antidote) source this file directly and never run the installer.
+  # Without jq every profile silently reports as 'incomplete' even when it works.
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "cs: warning — 'jq' not found in PATH. Profile status will read as 'incomplete'" >&2
+    echo "    and 'cs doctor' will not run. Install jq (brew install jq / apt install jq)." >&2
+  fi
+}
+
+# CS_QUIET suppresses the advisory notices for users who have read them once and
+# deliberately kept their own `claude` wrapper. The 'unsaved' case is real data
+# loss, not an advisory, so it is never silenced.
+if [[ -z "${CS_QUIET:-}" || "$_CS_FOREIGN_CLAUDE" == "unsaved" ]]; then
+  _cs_source_diagnostics
 fi
