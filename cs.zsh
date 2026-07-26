@@ -33,8 +33,9 @@
 # Re-sourcing this file must replace our own stale definitions (zsh keeps old
 # function bodies otherwise) — but a `claude` function we did NOT define belongs
 # to the user or another plugin, and silently destroying it is data loss. Tell
-# ours apart with a marker, and when a foreign wrapper is present, keep a copy
-# under _cs_prev_claude and say so rather than dropping it on the floor.
+# ours apart with a sentinel in the actual function body, and when a foreign
+# wrapper is present, keep a copy under _cs_prev_claude and say so rather than
+# dropping it on the floor.
 # Intentionally do not clear _CS_PROFILE: preserving the active profile across
 # re-source keeps reporting/wrapper behavior aligned with the exported config dir.
 #
@@ -44,7 +45,7 @@
 # error there.
 typeset -g _CS_FOREIGN_CLAUDE=""
 if typeset -f claude >/dev/null 2>&1; then
-  if [[ "${_CS_CLAUDE_WRAPPER_OWNED:-}" == "1" ]]; then
+  if [[ "$(typeset -f claude)" == *"_CS_CLAUDE_SWITCH_WRAPPER"* ]]; then
     unfunction claude 2>/dev/null
   else
     # Preserve the previous definition so the user can restore or inspect it.
@@ -288,6 +289,7 @@ _cs_login() {
 
   if ! _cs_profile_is_set_up "$name"; then
     echo "cs: login completed but no oauthAccount was written in $cfg_dir/.claude.json" >&2
+    _cs_login_cleanup "$name" "$cfg_dir" "$created"
     return 1
   fi
   echo "cs: saved isolated login for '$name' (email: $(_cs_profile_email "$name"))"
@@ -384,7 +386,9 @@ _cs_run() {
     return 1
   }
   _cs_build_scrub_args
-  env "${_cs_scrub[@]}" CLAUDE_CONFIG_DIR="$cfg_dir" claude "$@"
+  # Keep the child environment internally consistent when the calling shell is
+  # already pinned to another profile. Nested shells inherit both variables.
+  env "${_cs_scrub[@]}" _CS_PROFILE="$name" CLAUDE_CONFIG_DIR="$cfg_dir" claude "$@"
 }
 
 _cs_off() {
@@ -475,8 +479,8 @@ _cs_rm() {
   # symlinked $HOME or /var -> /private/var). Loop per service in case duplicate
   # items share the name. Warn rather than silently orphan a live credential.
   if command -v security >/dev/null 2>&1; then
-    local d svc had_before=0 leftover=0 probed=0
-    local -a dirs=("$cfg_dir")
+    local d svc had_before=0 probed=0
+    local -a dirs=("$cfg_dir") leftover_svcs=()
     [[ "${cfg_dir:A}" != "$cfg_dir" ]] && dirs+=("${cfg_dir:A}")
     for d in "${dirs[@]}"; do
       svc="$(_cs_keychain_service "$d")"
@@ -488,11 +492,13 @@ _cs_rm() {
       # a live credential orphaned without a word.
       security find-generic-password -s "$svc" >/dev/null 2>&1 && had_before=1
       while security delete-generic-password -s "$svc" >/dev/null 2>&1; do :; done
-      security find-generic-password -s "$svc" >/dev/null 2>&1 && leftover=1
+      security find-generic-password -s "$svc" >/dev/null 2>&1 && leftover_svcs+=("$svc")
     done
-    if ((leftover)); then
+    if ((${#leftover_svcs})); then
       echo "cs: warning — the keychain credential for '$name' is STILL PRESENT after deletion." >&2
-      echo "    Remove it by hand: security delete-generic-password -s '$svc'" >&2
+      for svc in "${leftover_svcs[@]}"; do
+        echo "    Remove it by hand: security delete-generic-password -s '$svc'" >&2
+      done
     elif ((!probed)); then
       # No sha256 tool, so we never derived a service name to look for.
       echo "cs: warning — could not derive the keychain service name for '$name'; a credential may remain." >&2
@@ -720,6 +726,9 @@ cs() {
 
 claude() {
   emulate -L zsh
+  # Function-body sentinel used at source time to distinguish this wrapper from
+  # a function restored or installed later by the user or another plugin.
+  : _CS_CLAUDE_SWITCH_WRAPPER
   [[ -n "${_CS_PROFILE:-}" ]] || {
     # Unpinned: pass through untouched (the user may intentionally be using an
     # API key or the default login here).
@@ -743,8 +752,6 @@ claude() {
   _cs_build_scrub_args
   env "${_cs_scrub[@]}" claude "$@"
 }
-# Mark the wrapper as ours so a later re-source can tell it from a foreign one.
-typeset -g _CS_CLAUDE_WRAPPER_OWNED=1
 
 #==============================================================================
 # Source-time diagnostics. Printed once per shell, to stderr, so they never

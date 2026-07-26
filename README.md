@@ -125,7 +125,7 @@ If another plugin or your own `.zshrc` already defines `claude`, claude-switch r
 functions[claude]=$functions[_cs_prev_claude]
 ```
 
-To leave the `claude` name alone entirely, skip the wrapper and use `cs run`, which executes the real binary directly under a profile:
+To leave the `claude` name alone after sourcing, restore the previous definition as shown above and use `cs run`, which executes the real binary directly under a profile:
 
 ```sh
 cs run work -- --version

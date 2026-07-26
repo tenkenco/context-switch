@@ -63,6 +63,15 @@ assert_eq() {
   fi
 }
 
+assert_not_eq() {
+  local desc="$1" actual="$2" unexpected="$3"
+  if [[ "$actual" != "$unexpected" ]]; then
+    _pass "$desc"
+  else
+    _fail "$desc" "expected values to differ" "actual: $actual"
+  fi
+}
+
 assert_file_exists() {
   local desc="$1" file="$2"
   [[ -f "$file" ]] && _pass "$desc" || _fail "$desc" "missing: $file"
@@ -97,6 +106,8 @@ setup() {
 if [ "$1" = "auth" ] && [ "$2" = "login" ]; then
   # Simulate a failed / Ctrl-C'd login: exit non-zero writing no config.
   [ -n "${CS_TEST_LOGIN_FAIL-}" ] && exit 130
+  # Simulate a nominally successful login that writes no usable account state.
+  [ -n "${CS_TEST_LOGIN_EMPTY-}" ] && exit 0
   [ -n "${CLAUDE_CODE_OAUTH_TOKEN-}" ] && printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" >"${HOME}/.auth-login-token-env"
   all="$*"
   email="login@example.com"
@@ -128,6 +139,7 @@ if [ "$1" = "auth" ] && [ "$2" = "logout" ]; then
 fi
 # record which overriding auth vars were present at launch so scrub is testable
 printf 'API=%s TOKEN=%s BEDROCK=%s VERTEX=%s\n' "${ANTHROPIC_API_KEY-}" "${CLAUDE_CODE_OAUTH_TOKEN-}" "${CLAUDE_CODE_USE_BEDROCK-}" "${CLAUDE_CODE_USE_VERTEX-}" >"${HOME}/.claude-launch-env"
+printf 'PROFILE=%s CONFIG=%s\n' "${_CS_PROFILE-}" "${CLAUDE_CONFIG_DIR-}" >"${HOME}/.claude-launch-profile"
 printf 'FAKE_CLAUDE: %s\n' "$*"
 SH
   chmod +x "$SANDBOX/bin/claude"
@@ -166,6 +178,7 @@ JSON
 # sandbox bin comes first on PATH, so these tests behave identically on Linux.
 fake_security() {
   : >"$HOME/.kc-present"
+  : >"$HOME/.kc-undeletable"
   cat >"$SANDBOX/bin/security" <<'SH'
 #!/bin/sh
 # usage: security {find,delete}-generic-password -s <service>
@@ -181,6 +194,7 @@ case "$cmd" in
     exit 44 ;;
   delete-generic-password)
     if grep -Fxq "$svc" "$HOME/.kc-present" 2>/dev/null; then
+      grep -Fxq "$svc" "$HOME/.kc-undeletable" 2>/dev/null && exit 77
       grep -Fxv "$svc" "$HOME/.kc-present" >"$HOME/.kc-present.tmp" 2>/dev/null
       mv "$HOME/.kc-present.tmp" "$HOME/.kc-present"
       exit 0
@@ -443,13 +457,11 @@ t_rm_legacy_credentials() {
 t_foreign_claude_function_preserved() {
   echo "[wrapper: a pre-existing 'claude' function is preserved, not destroyed]"
   setup
-  # Simulate another plugin (or the user's zshrc) owning `claude`, then re-source
-  # as a fresh install would: _CS_CLAUDE_WRAPPER_OWNED unset means "not ours".
-  unset _CS_CLAUDE_WRAPPER_OWNED
+  # Simulate another plugin (or the user's zshrc) owning `claude`.
   unfunction claude _cs_prev_claude 2>/dev/null
   claude() { echo "OTHER_PLUGIN_WRAPPER"; }
   # Source in THIS shell (not a $( ) subshell) so the function stash and the
-  # ownership marker actually persist; capture stderr via a file instead.
+  # preserved function actually persists; capture stderr via a file instead.
   local out err="$HOME/.src-err"
   source "$CS_ZSH" 2>"$err" >/dev/null
   out="$(cat "$err")"
@@ -460,10 +472,19 @@ t_foreign_claude_function_preserved() {
   assert_eq "previous definition preserved" "$prev" "OTHER_PLUGIN_WRAPPER"
 
   # Re-sourcing over our OWN wrapper must not warn or stash again.
-  unfunction _cs_prev_claude 2>/dev/null
   source "$CS_ZSH" 2>"$err" >/dev/null
   out="$(cat "$err")"
   assert_not_contains "no warning when replacing our own wrapper" "$out" "already defined"
+
+  # Restoring the foreign function makes it foreign again. A later re-source
+  # must preserve and report it instead of trusting stale ownership state.
+  functions -c _cs_prev_claude claude
+  unfunction _cs_prev_claude 2>/dev/null
+  source "$CS_ZSH" 2>"$err" >/dev/null
+  out="$(cat "$err")"
+  assert_contains "restored foreign wrapper detected on re-source" "$out" "already defined"
+  prev="$(_cs_prev_claude 2>&1)"
+  assert_eq "restored wrapper preserved again" "$prev" "OTHER_PLUGIN_WRAPPER"
   teardown
 }
 
@@ -480,6 +501,20 @@ t_run_subcommand() {
   # Args should reach claude without the '--' being required.
   out="$(cs run personal --version 2>&1)"
   assert_contains "'--' is optional" "$out" "FAKE_CLAUDE: --version"
+
+  # A one-shot run from an already-pinned shell must present one coherent
+  # profile to Claude and to any nested shell it launches.
+  seed_profile work
+  cs use personal >/dev/null 2>&1
+  out="$(cs run work -- hi 2>&1)"
+  assert_contains "run from pinned shell still invokes Claude" "$out" "FAKE_CLAUDE: hi"
+  local launched
+  launched="$(<"$HOME/.claude-launch-profile")"
+  assert_eq "child profile matches run target" "$launched" \
+    "PROFILE=work CONFIG=$HOME/.claude/profiles/work"
+  assert_eq "calling shell keeps its pin" "${_CS_PROFILE:-}" "personal"
+  assert_eq "calling shell keeps its config" "${CLAUDE_CONFIG_DIR:-}" \
+    "$HOME/.claude/profiles/personal"
 
   out="$(cs run ../evil 2>&1)"
   assert_contains "validates the name" "$out" "invalid profile name"
@@ -551,10 +586,38 @@ t_login_abort_cleans_up() {
   out="$(cs list 2>&1)"
   assert_contains "list stays clean" "$out" "(no profiles"
 
+  out="$(CS_TEST_LOGIN_EMPTY=1 cs login empty-login 2>&1)"
+  assert_contains "empty successful login is rejected" "$out" "no oauthAccount"
+  assert_dir_absent "empty successful login is cleaned up" \
+    "$HOME/.claude/profiles/empty-login"
+
   # An existing, already-working profile must survive a failed re-login.
   seed_profile personal
   CS_TEST_LOGIN_FAIL=1 cs login personal >/dev/null 2>&1
   assert_file_exists "existing profile untouched" "$HOME/.claude/profiles/personal/.claude.json"
+  teardown
+}
+
+t_rm_reports_exact_leftover_service() {
+  echo "[rm: reports the exact keychain service that survived deletion]"
+  setup
+  fake_security
+  local target="$HOME/profile-target" cfg_dir="$HOME/.claude/profiles/personal"
+  mkdir -p "$target" "$HOME/.claude/profiles"
+  ln -s "$target" "$cfg_dir"
+  local literal_svc canonical_svc
+  literal_svc="$(_cs_keychain_service "$cfg_dir")"
+  canonical_svc="$(_cs_keychain_service "${cfg_dir:A}")"
+  assert_not_eq "symlink produces distinct keychain services" "$literal_svc" "$canonical_svc"
+  printf '%s\n' "$literal_svc" >"$HOME/.kc-present"
+  printf '%s\n' "$literal_svc" >"$HOME/.kc-undeletable"
+
+  local out
+  out="$(printf 'y\n' | cs rm personal 2>&1)"
+  assert_contains "warning names surviving literal service" "$out" \
+    "security delete-generic-password -s '$literal_svc'"
+  assert_not_contains "warning does not name absent canonical service" "$out" \
+    "security delete-generic-password -s '$canonical_svc'"
   teardown
 }
 
@@ -752,6 +815,7 @@ t_run_subcommand
 t_doctor_needs_real_binary
 t_credential_missing_is_reported
 t_login_abort_cleans_up
+t_rm_reports_exact_leftover_service
 t_installer
 
 #------------------------------------------------------------------- summary
