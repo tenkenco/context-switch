@@ -68,7 +68,14 @@ jobs:
 
       - name: Check zsh syntax
         run: |
-          zsh -n claude-switch.plugin.zsh cs.zsh tests/smoke.zsh
+          set -euo pipefail
+          # One `zsh -n` per file: extra arguments become $1/$2 for the script
+          # being parsed, NOT additional files to check, so the single-command
+          # form silently only ever parsed claude-switch.plugin.zsh.
+          for f in claude-switch.plugin.zsh cs.zsh tests/smoke.zsh; do
+            echo "zsh -n $f"
+            zsh -n "$f"
+          done
 
   smoke:
     strategy:

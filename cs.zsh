@@ -134,6 +134,26 @@ _cs_profile_is_set_up() {
   jq -e '.oauthAccount.emailAddress? // empty' "$cfg" >/dev/null 2>&1
 }
 
+# Legacy plaintext credential files from the pre-keychain `cs save` era, kept
+# at ~/.claude/accounts/<name>.*:
+#   <name>.token        - long-lived OAuth bearer token
+#   <name>.account.json - account snapshot (email, org, tier)
+#   <name>.json         - full credential dump: the claude.ai OAuth access and
+#                         refresh tokens PLUS every MCP server's tokens and
+#                         client secrets
+# Nothing in the current code writes these, and nothing else removes them, so a
+# profile deleted after upgrading would leave live credentials on disk. `cs rm`
+# takes them with the profile. Populates the global _cs_legacy_files (same
+# pattern as _cs_scrub) with the ones that actually exist.
+typeset -ga _cs_legacy_files
+_cs_find_legacy_files() {
+  _cs_legacy_files=()
+  local name="$1" dir="$HOME/.claude/accounts" f
+  for f in "$dir/$name.token" "$dir/$name.account.json" "$dir/$name.json"; do
+    [[ -f "$f" ]] && _cs_legacy_files+=("$f")
+  done
+}
+
 #==============================================================================
 # Subcommand implementations.
 #==============================================================================
@@ -270,11 +290,23 @@ _cs_rm() {
 
   local cfg_dir
   cfg_dir="$(_cs_profile_config_dir "$name")"
-  [[ -d "$cfg_dir" ]] || {
+  # A profile upgraded from the `cs save` era may have legacy credential files
+  # and no config dir (it was never re-created with `cs login`). Accept either,
+  # so those credentials are removable at all.
+  _cs_find_legacy_files "$name"
+  if [[ ! -d "$cfg_dir" ]] && ((${#_cs_legacy_files} == 0)); then
     echo "cs: no such profile: $name" >&2
     return 1
-  }
-  printf "delete profile '%s' (config + keychain login)? [y/N] " "$name"
+  fi
+
+  local what="config + keychain login"
+  if ((${#_cs_legacy_files})); then
+    what="$what + legacy credential files"
+    echo "cs: '$name' has legacy plaintext credential files from an older cs:" >&2
+    local f
+    for f in "${_cs_legacy_files[@]}"; do echo "      $f" >&2; done
+  fi
+  printf "delete profile '%s' (%s)? [y/N] " "$name" "$what"
   local ans
   read -r ans
   [[ "$ans" == "y" || "$ans" == "Y" ]] || {
@@ -303,6 +335,19 @@ _cs_rm() {
   fi
 
   rm -rf "$cfg_dir"
+  if ((${#_cs_legacy_files})); then
+    # Report anything that survived rather than claiming a clean removal: these
+    # are live credentials, so a silent failure is the worst outcome.
+    rm -f "${_cs_legacy_files[@]}"
+    local left=() f
+    for f in "${_cs_legacy_files[@]}"; do
+      [[ -e "$f" ]] && left+=("$f")
+    done
+    if ((${#left})); then
+      echo "cs: warning — could not delete: ${left[*]}" >&2
+      echo "    These hold live credentials; remove them by hand." >&2
+    fi
+  fi
   if [[ "${_CS_PROFILE:-}" == "$name" ]]; then
     unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE
   fi
@@ -427,7 +472,8 @@ Usage:
                     logged into more than one namespace (the thing that causes
                     surprise re-logins).
   cs current        Print the pin for this shell.
-  cs rm <name>      Delete a profile's config and its keychain login.
+  cs rm <name>      Delete a profile's config, its keychain login, and any
+                    legacy plaintext credential files left by an older cs.
 
 One-time setup (per account):
   cs login personal

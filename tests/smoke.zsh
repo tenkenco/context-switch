@@ -135,7 +135,8 @@ SH
     ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX 2>/dev/null
   unfunction cs claude _cs_validate_name _cs_profiles_root _cs_profile_config_dir \
     _cs_sha256_8 _cs_keychain_service _cs_profile_email _cs_profile_is_set_up \
-    _cs_build_scrub_args _cs_login _cs_use _cs_off _cs_list _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
+    _cs_build_scrub_args _cs_find_legacy_files _cs_login _cs_use _cs_off _cs_list \
+    _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
   source "$CS_ZSH"
 }
 
@@ -154,6 +155,15 @@ seed_profile() {
   cat >"$cfg_dir/.claude.json" <<JSON
 {"oauthAccount":{"emailAddress":"$email","organizationUuid":"org-$name"}}
 JSON
+}
+
+# Create the plaintext credential files a pre-keychain `cs save` left behind.
+seed_legacy_files() {
+  local name="$1" dir="$HOME/.claude/accounts"
+  mkdir -p "$dir"
+  printf 'sk-ant-oat01-FAKE\n' >"$dir/$name.token"
+  printf '{"emailAddress":"%s@example.com"}\n' "$name" >"$dir/$name.account.json"
+  printf '{"claudeAiOauth":{"accessToken":"FAKE","refreshToken":"FAKE"}}\n' >"$dir/$name.json"
 }
 
 #------------------------------------------------------------------- tests
@@ -348,6 +358,46 @@ t_rm() {
   teardown
 }
 
+t_rm_legacy_credentials() {
+  echo "[rm: deletes legacy plaintext credential files]"
+  setup
+  local acct="$HOME/.claude/accounts" out
+
+  # Profile with BOTH a config dir and legacy files.
+  seed_profile personal
+  seed_legacy_files personal
+  out="$(printf 'y\n' | cs rm personal 2>&1)"
+  assert_contains "warns about legacy files" "$out" "legacy plaintext credential files"
+  assert_dir_absent "config removed" "$HOME/.claude/profiles/personal"
+  assert_file_absent "token removed" "$acct/personal.token"
+  assert_file_absent "account snapshot removed" "$acct/personal.account.json"
+  assert_file_absent "credential dump removed" "$acct/personal.json"
+
+  # Legacy files only, no config dir — the upgrade case that was unremovable.
+  seed_legacy_files orphan
+  out="$(printf 'y\n' | cs rm orphan 2>&1)"
+  assert_not_contains "legacy-only profile is removable" "$out" "no such profile"
+  assert_file_absent "orphan token removed" "$acct/orphan.token"
+  assert_file_absent "orphan dump removed" "$acct/orphan.json"
+
+  # Declining must not delete credentials.
+  seed_legacy_files keep
+  out="$(printf 'n\n' | cs rm keep 2>&1)"
+  assert_contains "declined aborts" "$out" "aborted"
+  assert_file_exists "token kept after abort" "$acct/keep.token"
+
+  # A name with no config dir and no legacy files is still an error.
+  out="$(cs rm ghost 2>&1)"
+  assert_contains "still errors on unknown profile" "$out" "no such profile"
+
+  # Other profiles' files are untouched.
+  seed_legacy_files other
+  seed_profile personal
+  printf 'y\n' | cs rm personal >/dev/null 2>&1
+  assert_file_exists "other profile's token untouched" "$acct/other.token"
+  teardown
+}
+
 t_rm_pinned_clears_env() {
   echo "[rm: removing pinned profile clears env]"
   setup
@@ -495,6 +545,7 @@ t_list
 t_current
 t_resource_preserves_profile
 t_rm
+t_rm_legacy_credentials
 t_rm_pinned_clears_env
 t_doctor_healthy_and_duplicate
 t_doctor_default_duplicate
