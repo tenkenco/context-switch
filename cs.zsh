@@ -37,16 +37,18 @@
 # under _cs_prev_claude and say so rather than dropping it on the floor.
 # Intentionally do not clear _CS_PROFILE: preserving the active profile across
 # re-source keeps reporting/wrapper behavior aligned with the exported config dir.
+#
+# Written with plain-command tests (`typeset -f`, `functions -c`) rather than
+# zsh's ${+functions[...]} / $functions[...] forms: this file is also parsed by
+# shfmt and shellcheck as bash, and those flag-style expansions are a hard parse
+# error there.
 typeset -g _CS_FOREIGN_CLAUDE=""
-if ((${+functions[claude]})); then
+if typeset -f claude >/dev/null 2>&1; then
   if [[ "${_CS_CLAUDE_WRAPPER_OWNED:-}" == "1" ]]; then
     unfunction claude 2>/dev/null
   else
     # Preserve the previous definition so the user can restore or inspect it.
-    # zsh's $functions maps names to bodies; shellcheck reads the subscript as a
-    # variable reference, hence the disable.
-    # shellcheck disable=SC2154
-    functions[_cs_prev_claude]="${functions[claude]}"
+    functions -c claude _cs_prev_claude 2>/dev/null
     _CS_FOREIGN_CLAUDE=1
     unfunction claude 2>/dev/null
   fi
