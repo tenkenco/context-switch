@@ -952,14 +952,114 @@ t_profile_env_tracks_multiple_exports_per_line() {
   cs off >/dev/null 2>&1
   assert_eq "both cleared" "${CS_TEST_ONE:-_NONE_}/${CS_TEST_TWO:-_NONE_}" "_NONE_/_NONE_"
 
-  # A quoted value may contain a decoy "WORD=" that is not a variable.
+  # A QUOTED line with two candidates is ambiguous: cs cannot tell a real name
+  # from text inside a quoted value without implementing shell quoting. Guessing
+  # the first one was a security hole, not just an incomplete feature — see
+  # t_profile_env_quoted_multi_cannot_smuggle_blocked_name. Refuse instead.
   teardown
   setup
   seed_profile personal
   seed_profile_env personal 'export CS_TEST_ONE="a CS_TEST_TWO=decoy"'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "refuses the ambiguous line" "$out" "more than one"
+  assert_contains "says how to fix it" "$out" "one 'export VAR=value' on each line"
+  assert_eq "nothing applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_quoted_multi_cannot_smuggle_blocked_name() {
+  echo "[profile.env: a quoted line cannot smuggle a blocked name past the check]"
+  setup
+  seed_profile personal
+  # The blocked-name check runs on parsed names. A parser that kept only the
+  # FIRST name on a quoted line let PATH through untracked and unchecked: the
+  # file was sourced and the shell was left unable to run any command.
+  seed_profile_env personal 'export CS_TEST_ONE="yes" PATH="/nowhere"'
+  local saved_path="$PATH"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "refuses the file" "$out" "more than one"
+  assert_eq "PATH untouched" "$PATH" "$saved_path"
+  assert_eq "the shell can still run commands" "$(command -v env >/dev/null && echo yes || echo no)" "yes"
+  assert_eq "nothing applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_not_contains "does not claim success" "$out" "profile.env applied"
+  teardown
+}
+
+t_profile_env_survives_hostile_ifs() {
+  echo "[profile.env: a bare IFS assignment cannot strand the cleanup]"
+  setup
+  seed_profile personal
+  # `export IFS=` is blocked, but a BARE assignment is invisible to the parser
+  # and still changes the shell. cs off must split its own record regardless.
+  seed_profile_env personal 'export CS_TEST_ONE=one
+export CS_TEST_TWO=two
+IFS=,'
+  local saved_ifs="$IFS"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_eq "both applied" "${CS_TEST_ONE:-}/${CS_TEST_TWO:-}" "one/two"
+  assert_eq "IFS restored in the caller's shell" "$IFS" "$saved_ifs"
+  assert_contains "says it restored IFS" "$out" "changed IFS"
+  cs off >/dev/null 2>&1
+  assert_eq "first cleared" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "second cleared" "${CS_TEST_TWO:-_NONE_}" "_NONE_"
+  assert_eq "shell fully unpinned" "${_CS_PROFILE:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_bare_path_assignment_restored() {
+  echo "[profile.env: a bare PATH assignment is restored, not left broken]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one
+PATH=/nowhere'
+  local saved_path="$PATH"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_eq "PATH restored" "$PATH" "$saved_path"
+  assert_contains "says it restored PATH" "$out" "changed PATH"
+  assert_eq "the ordinary export still applied" "${CS_TEST_ONE:-}" "one"
+  teardown
+}
+
+t_profile_env_tracking_survives_self_unset() {
+  echo "[profile.env: a file cannot disable its own cleanup]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one
+export CS_TEST_TWO=two
+unset _CS_PROFILE_ENV_VARS'
   cs use personal >/dev/null 2>&1
-  assert_eq "decoy not tracked" "${_CS_PROFILE_ENV_VARS:-}" "CS_TEST_ONE"
-  assert_eq "decoy not exported" "${CS_TEST_TWO:-_NONE_}" "_NONE_"
+  assert_eq "record re-asserted after sourcing" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "CS_TEST_ONE CS_TEST_TWO"
+  cs off >/dev/null 2>&1
+  assert_eq "first cleared" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "second cleared" "${CS_TEST_TWO:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_symlink_target_directory_checked() {
+  echo "[profile.env: the symlink target's directory is checked too]"
+  setup
+  seed_profile personal
+  # File mode is perfect and the profile dir is 0700. The target's DIRECTORY is
+  # what a teammate could write, and that is where the file can be replaced.
+  local shared="$SANDBOX/shared"
+  mkdir -p "$shared"
+  printf 'export CS_TEST_ONE=one\n' >"$shared/env.sh"
+  chmod 600 "$shared/env.sh"
+  chmod 777 "$shared"
+  ln -s "$shared/env.sh" "$HOME/.claude/profiles/personal/profile.env"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "refuses on the target's directory" "$out" "its directory"
+  assert_eq "nothing applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
   teardown
 }
 
@@ -1187,6 +1287,11 @@ t_profile_env_symlink_permissions_checked
 t_profile_env_refuses_writable_directory
 t_profile_env_clear_ignores_blocked_names
 t_profile_env_tracks_multiple_exports_per_line
+t_profile_env_quoted_multi_cannot_smuggle_blocked_name
+t_profile_env_survives_hostile_ifs
+t_profile_env_bare_path_assignment_restored
+t_profile_env_tracking_survives_self_unset
+t_profile_env_symlink_target_directory_checked
 t_profile_env_run_clears_caller_env
 t_profile_env_refuses_world_writable
 t_profile_env_reaches_run_without_pinning

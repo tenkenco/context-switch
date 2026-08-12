@@ -177,29 +177,47 @@ typeset -ga _CS_ENV_BLOCKED_VARS=(
 # still runs when the file is sourced — cs simply cannot track or unset what it
 # did. Keep the file to plain exports and this stays predictable.
 typeset -ga _cs_env_var_names
+typeset -g _cs_env_parse_ambiguous=0
 _cs_parse_env_vars() {
   _cs_env_var_names=()
+  _cs_env_parse_ambiguous=0
   local f="$1" name
   [[ -f "$f" ]] || return 0
   # `export A=1 B=2` really does set both, so tracking only the first would
   # leave B set forever. Split an export line on whitespace and take every
-  # NAME= token — but ONLY when the line carries no quote, since a quoted value
-  # may legitimately contain spaces and even a "WORD=" that is not a variable
-  # (export K="a B=2"). A quoted line falls back to its first name, which is all
-  # the documented one-export-per-line contract promises anyway.
+  # NAME= token.
+  #
+  # A QUOTED line is the hard case, because a quoted value may contain spaces
+  # and even a "WORD=" that is not a variable at all (export K="a B=2"). There
+  # is no way to tell those apart without implementing shell quoting here. An
+  # earlier version silently kept just the first name, and that was a security
+  # hole, not merely incomplete: `export CS_OK="yes" PATH="/nowhere"` hid PATH
+  # from the blocked-name check, sourced the file, and broke the shell.
+  #
+  # So a quoted line carrying more than one candidate is reported as ambiguous
+  # and the caller refuses the whole file. Guessing is the one option that is
+  # never safe.
   while IFS= read -r name; do
-    [[ -n "$name" ]] && _cs_env_var_names+=("$name")
+    [[ -z "$name" ]] && continue
+    if [[ "$name" == "!AMBIGUOUS" ]]; then
+      _cs_env_parse_ambiguous=1
+      continue
+    fi
+    _cs_env_var_names+=("$name")
   done < <(awk '
     /^[[:space:]]*export[[:space:]]/ {
       line = $0
       sub(/^[[:space:]]*export[[:space:]]+/, "", line)
-      first_only = (line ~ /["'"'"']/)
+      quoted = (line ~ /["'"'"']/)
       n = split(line, parts, /[[:space:]]+/)
+      count = 0
+      for (i = 1; i <= n; i++)
+        if (parts[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) count++
+      if (quoted && count > 1) { print "!AMBIGUOUS"; next }
       for (i = 1; i <= n; i++) {
         if (parts[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
           eq = index(parts[i], "=")
           print substr(parts[i], 1, eq - 1)
-          if (first_only) break
         }
       }
     }
@@ -227,6 +245,11 @@ _cs_env_find_blocked() {
 # re-parsing it then would leave the stale vars set forever.
 _cs_clear_profile_env() {
   [[ -n "${_CS_PROFILE_ENV_VARS:-}" ]] || return 0
+  # Split on whitespace whatever the caller's IFS is. `emulate -L zsh` does not
+  # reset IFS, and a profile.env line as ordinary as `IFS=,` would otherwise
+  # make the loop below see one giant field and call `unset "CS_A CS_B"`, which
+  # fails on an invalid parameter name and strands every tracked variable.
+  local IFS=$' \t\n'
   local v b skip
   # Unquoted command substitution field-splits in both zsh and bash. Var names
   # are validated at parse time, so splitting on whitespace is safe here.
@@ -260,6 +283,14 @@ _cs_env_path_unsafe() {
     printf 'it is not owned by you'
     return 0
   fi
+  # Prove find can actually answer before trusting an empty answer. This is a
+  # security gate, so "find is missing" or "-perm is unsupported" must read as a
+  # refusal, not as approval. Without this probe the mode check fails OPEN: on a
+  # box with zsh but no findutils, a chmod 666 file you own would sail through.
+  if [[ -z "$(find -L "$p" -maxdepth 0 -print 2>/dev/null)" ]]; then
+    printf 'its permissions could not be read'
+    return 0
+  fi
   if [[ -n "$(find -L "$p" -maxdepth 0 \( -perm -g+w -o -perm -o+w \) 2>/dev/null)" ]]; then
     printf 'it is group- or world-writable'
     return 0
@@ -287,16 +318,29 @@ _cs_load_profile_env() {
   # passes the check above with a perfect-looking mode. `cs login` creates the
   # directory 0700, but a permissive umask, a restored backup, or a synced home
   # can loosen it after the fact — and nothing else would ever notice.
+  #
+  # Check BOTH the profile directory and the directory the file really lives in.
+  # When profile.env is a symlink those differ, and it is the target's directory
+  # that decides who can delete-and-replace the thing actually sourced.
   local d
-  d="$(_cs_profile_config_dir "$1")"
-  if why="$(_cs_env_path_unsafe "$d")"; then
-    echo "cs: refusing to load $f — its directory $d is unsafe: $why." >&2
-    echo "    Anyone who can write that directory can replace the file." >&2
-    echo "    Fix it with: chmod 700 '$d'" >&2
-    return 1
-  fi
+  for d in "$(_cs_profile_config_dir "$1")" "${f:A:h}"; do
+    if why="$(_cs_env_path_unsafe "$d")"; then
+      echo "cs: refusing to load $f — its directory $d is unsafe: $why." >&2
+      echo "    Anyone who can write that directory can replace the file." >&2
+      echo "    Fix it with: chmod 700 '$d'" >&2
+      return 1
+    fi
+  done
 
   _cs_parse_env_vars "$f"
+
+  if ((_cs_env_parse_ambiguous)); then
+    echo "cs: refusing to load $f — a quoted export line sets more than one" >&2
+    echo "    variable, and cs cannot tell a real name from text inside a quoted" >&2
+    echo "    value. Put one 'export VAR=value' on each line." >&2
+    _cs_env_var_names=()
+    return 1
+  fi
 
   _cs_env_find_blocked
   if ((${#_cs_env_blocked_found})); then
@@ -316,8 +360,52 @@ _cs_load_profile_env() {
   # drift this feature exists to stop.
   ((${#_cs_env_var_names})) && export _CS_PROFILE_ENV_VARS="${_cs_env_var_names[*]}"
 
+  # Snapshot the shell essentials before sourcing. The blocked-name check reads
+  # `export` lines, but a BARE assignment (`IFS=,`, `PATH=/nowhere`) never
+  # reaches the parser and still changes this shell, because these variables are
+  # already exported. A poisoned IFS is the nastiest of them: it silently breaks
+  # every word split cs performs afterwards, including its own cleanup.
+  local _sv_path="$PATH" _sv_ifs="$IFS" _sv_home="$HOME"
+  local _sv_shell="${SHELL-}" _sv_tmpdir="${TMPDIR-}"
+
   # shellcheck source=/dev/null
-  if ! source "$f"; then
+  source "$f"
+  local src_rc=$?
+
+  # Put back anything the file moved, and say so. Listed by name rather than by
+  # indirection so shfmt and shellcheck can still parse this file.
+  local moved=()
+  [[ "$PATH" != "$_sv_path" ]] && {
+    PATH="$_sv_path"
+    moved+=(PATH)
+  }
+  [[ "$IFS" != "$_sv_ifs" ]] && {
+    IFS="$_sv_ifs"
+    moved+=(IFS)
+  }
+  [[ "$HOME" != "$_sv_home" ]] && {
+    HOME="$_sv_home"
+    moved+=(HOME)
+  }
+  [[ "${SHELL-}" != "$_sv_shell" ]] && {
+    SHELL="$_sv_shell"
+    moved+=(SHELL)
+  }
+  [[ "${TMPDIR-}" != "$_sv_tmpdir" ]] && {
+    TMPDIR="$_sv_tmpdir"
+    moved+=(TMPDIR)
+  }
+  ((${#moved})) && echo "cs: note — profile.env changed ${moved[*]}; cs restored it." >&2
+
+  # Re-assert the record AFTER sourcing, for the same reason `cs use` re-asserts
+  # the pin: the blocked-name check reads `export` lines, but the file is sourced,
+  # so a bare `unset _CS_PROFILE_ENV_VARS` (or a bare assignment) is invisible to
+  # the parser and would silently disable every later cleanup.
+  if ((${#_cs_env_var_names})); then
+    export _CS_PROFILE_ENV_VARS="${_cs_env_var_names[*]}"
+  fi
+
+  if ((src_rc != 0)); then
     echo "cs: $f returned a non-zero status. Its exports are still tracked, so" >&2
     echo "    'cs off' will clear them — but check the file for a failing line." >&2
     return 1

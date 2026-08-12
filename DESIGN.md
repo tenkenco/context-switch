@@ -180,6 +180,28 @@ profile while `claude` launches as another.
 Rejecting the whole file beats ignoring one line. A partly applied file leaves
 the user with an identity they did not ask for and no error to explain it.
 
+The same rule decides what to do with an ambiguous line. A quoted value can
+contain spaces, and even a `WORD=` that is not a variable, so
+`export K="a B=2"` and `export K="a" B=2` cannot be told apart without
+implementing shell quoting. An early version kept the first name and moved on.
+That was a security hole rather than a rough edge: `export OK="yes"
+PATH="/nowhere"` hid `PATH` from the check above, sourced the file, and left an
+interactive shell that could not run a single command. `cs` now refuses a
+quoted line that carries more than one candidate.
+
+### Bare assignments, and why cs restores five variables
+
+The refused-names check reads `export` lines. A bare `PATH=/nowhere` or
+`IFS=,` never reaches it, and still changes the shell, because those variables
+are already exported. A poisoned `IFS` is the worst of them. It silently breaks
+every word split that follows, including the one `cs off` performs on its own
+record, which strands every tracked variable.
+
+So `cs` snapshots `PATH`, `IFS`, `HOME`, `SHELL`, and `TMPDIR` before sourcing,
+restores any the file moved, and names them. This is the same idea as the pin
+re-assert: `cs` cannot contain arbitrary code, but it can put back the few
+values it knows must not change.
+
 `cs use` also re-asserts `CLAUDE_CONFIG_DIR` and `_CS_PROFILE` after sourcing.
 The refused-names check reads `export` lines, but the file is sourced, so a bare
 `CLAUDE_CONFIG_DIR=...` assignment still updates the already-exported variable.

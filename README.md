@@ -91,7 +91,16 @@ Then open a new terminal (or `source ~/.zshrc`) and run `cs help`.
 
 ### Already installed as claude-switch?
 
-Nothing breaks. GitHub redirects the old repository URL, and `claude-switch.plugin.zsh` still loads the tool. Your existing `source ~/.claude-switch/cs.zsh` line keeps working. Rename the checkout whenever you want to.
+Nothing breaks. GitHub redirects the old repository URL, and `claude-switch.plugin.zsh` still loads the tool. Your existing `source ~/.claude-switch/cs.zsh` line keeps working.
+
+Renaming the checkout does break it, because `install.sh` writes an absolute path into your `.zshrc`. Update that line in the same step:
+
+```sh
+mv ~/.claude-switch ~/.context-switch
+sed -i '' 's|/.claude-switch/cs.zsh|/.context-switch/cs.zsh|' ~/.zshrc
+```
+
+Re-running `install.sh` does not repair the old line. It only looks for its own current `source` line, so it appends a second one.
 
 ## One-time setup (per account)
 
@@ -174,7 +183,11 @@ Set `GOOGLE_APPLICATION_CREDENTIALS` as well as `CLOUDSDK_CONFIG`. The gcloud CL
 
 `cs` tracks the names on `export VAR=value` lines, and unsets exactly those. Two exports on one unquoted line both count.
 
+`cs` refuses the file when a **quoted** line sets more than one variable. It cannot tell a real name from text inside a quoted value, and guessing the first one was a security hole: `export OK="yes" PATH="/nowhere"` hid `PATH` from the refused-names check. Put one export on each line.
+
 Any other shell code in the file still runs when the file is sourced. `cs` cannot track that. A conditional export like `[[ -d "$D" ]] && export X=1` does not start with `export`, so it falls outside the contract. Keep the file to plain exports.
+
+A bare assignment with no `export` also escapes the parser, because these variables are already exported. `cs` restores `PATH`, `IFS`, `HOME`, `SHELL`, `TMPDIR`, and the pin variables after it sources the file, and tells you when it had to.
 
 `cs off` unsets a tracked name. It does not restore a value your shell held before `cs use`. If your `.zshrc` sets `AWS_PROFILE` and a `profile.env` overrides it, `cs off` leaves `AWS_PROFILE` unset.
 
