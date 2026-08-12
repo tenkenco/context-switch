@@ -41,11 +41,13 @@ jobs:
 
       - name: Check shell formatting
         run: |
-          shfmt -d -i 2 install.sh cs.zsh tests/smoke.zsh claude-switch.plugin.zsh
+          shfmt -d -i 2 install.sh cs.zsh tests/smoke.zsh \
+            context-switch.plugin.zsh claude-switch.plugin.zsh
 
       - name: Run shellcheck
         run: |
-          shellcheck -x install.sh cs.zsh claude-switch.plugin.zsh
+          shellcheck -x install.sh cs.zsh \
+            context-switch.plugin.zsh claude-switch.plugin.zsh
 
       - name: Lint GitHub Actions workflows
         env:
@@ -71,8 +73,8 @@ jobs:
           set -euo pipefail
           # One `zsh -n` per file: extra arguments become $1/$2 for the script
           # being parsed, NOT additional files to check, so the single-command
-          # form silently only ever parsed claude-switch.plugin.zsh.
-          for f in claude-switch.plugin.zsh cs.zsh tests/smoke.zsh; do
+          # form silently only ever parsed the first plugin file.
+          for f in context-switch.plugin.zsh claude-switch.plugin.zsh cs.zsh tests/smoke.zsh; do
             echo "zsh -n $f"
             zsh -n "$f"
           done

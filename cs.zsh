@@ -1,6 +1,7 @@
 # shellcheck disable=SC2148
-# claude-switch — per-terminal Claude Code account switcher.
-# https://github.com/tenkenco/claude-switch
+# context-switch — per-terminal identity switcher for Claude Code and any other
+# CLI that reads its config path from the environment.
+# https://github.com/tenkenco/context-switch
 #
 # Usage:
 #   1. Source this file from your ~/.zshrc:   source /path/to/cs.zsh
@@ -8,6 +9,22 @@
 #                                            cs login work
 #   3. Pin a terminal to a profile:          cs use work
 #   4. Run claude in that terminal:          claude
+#
+# Other tools (profile.env):
+#   Each profile may hold a `profile.env` file. `cs use` sources it, so one
+#   command pins the whole toolchain — gcloud, AWS, kubectl, gh — not just
+#   Claude Code. `cs env <name>` prints it. The contract is one
+#   `export VAR=value` per line; cs tracks exactly those names, and unsets them
+#   on `cs off` or when you pin the shell to a different profile. cs refuses a
+#   file that exports PATH or the pin variables — see _CS_ENV_BLOCKED_VARS.
+#
+#   Why this matters for gcloud in particular: ~/.config/gcloud/active_config
+#   and ~/.config/gcloud/application_default_credentials.json are single global
+#   files. `gcloud auth login` rewrites them for every shell at once, which
+#   breaks Terraform in whatever other terminal was using the other account.
+#   Pointing CLOUDSDK_CONFIG (and GOOGLE_APPLICATION_CREDENTIALS, which Go-based
+#   tools such as the Terraform google provider read directly) at a per-profile
+#   directory removes the shared file entirely.
 #
 # How it works:
 #   Claude Code 2.x stores OAuth credentials in the OS keychain, in an entry
@@ -122,12 +139,152 @@ _cs_validate_name() {
   return 0
 }
 
+# Profiles stay under ~/.claude even though cs now pins more than Claude Code.
+# Do NOT "tidy" this into ~/.config/context-switch: Claude Code names each
+# profile's keychain entry by the sha256 of CLAUDE_CONFIG_DIR, so moving the
+# directory orphans every stored credential and forces a re-login everywhere.
 _cs_profiles_root() { printf '%s' "$HOME/.claude/profiles"; }
 
 # Per-profile config root. Claude Code honors CLAUDE_CONFIG_DIR for both the
 # visible config and the keychain credential slot it derives from that path.
 _cs_profile_config_dir() {
   printf '%s' "$(_cs_profiles_root)/$1"
+}
+
+# Optional per-profile environment file for every OTHER tool. Lives inside the
+# config dir so `cs rm` removes it with the profile and nothing else has to know
+# about it.
+_cs_profile_env_file() {
+  printf '%s' "$(_cs_profile_config_dir "$1")/profile.env"
+}
+
+# Names a profile.env must NOT set. cs refuses such a file outright rather than
+# applying part of it, because both groups below break something the user cannot
+# easily see:
+#   - PATH, HOME, IFS, PWD, SHELL, TMPDIR: `cs off` unsets every tracked name,
+#     and a shell left without PATH cannot run a single command.
+#   - CLAUDE_CONFIG_DIR, _CS_PROFILE, _CS_PROFILE_ENV_VARS: these ARE the pin.
+#     A file that rewrites them makes `cs use` report one profile while claude
+#     launches as another.
+typeset -ga _CS_ENV_BLOCKED_VARS=(
+  PATH HOME IFS PWD OLDPWD SHELL TMPDIR
+  CLAUDE_CONFIG_DIR _CS_PROFILE _CS_PROFILE_ENV_VARS
+)
+
+# Names the env file exports, so `cs use` and `cs off` can undo them later.
+#
+# CONTRACT: one `export VAR=value` per line. Any other shell code in the file
+# still runs when the file is sourced — cs simply cannot track or unset what it
+# did. Keep the file to plain exports and this stays predictable.
+typeset -ga _cs_env_var_names
+_cs_parse_env_vars() {
+  _cs_env_var_names=()
+  local f="$1" name
+  [[ -f "$f" ]] || return 0
+  # `export A=1 B=2` really does set both, so tracking only the first would
+  # leave B set forever. Split an export line on whitespace and take every
+  # NAME= token — but ONLY when the line carries no quote, since a quoted value
+  # may legitimately contain spaces and even a "WORD=" that is not a variable
+  # (export K="a B=2"). A quoted line falls back to its first name, which is all
+  # the documented one-export-per-line contract promises anyway.
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && _cs_env_var_names+=("$name")
+  done < <(awk '
+    /^[[:space:]]*export[[:space:]]/ {
+      line = $0
+      sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+      first_only = (line ~ /["'"'"']/)
+      n = split(line, parts, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        if (parts[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+          eq = index(parts[i], "=")
+          print substr(parts[i], 1, eq - 1)
+          if (first_only) break
+        }
+      }
+    }
+  ' "$f" 2>/dev/null)
+  return 0
+}
+
+# Names in _cs_env_var_names that cs refuses to manage. Populates the global
+# _cs_env_blocked_found (same pattern as _cs_scrub).
+typeset -ga _cs_env_blocked_found
+_cs_env_find_blocked() {
+  _cs_env_blocked_found=()
+  local n b
+  for n in "${_cs_env_var_names[@]}"; do
+    for b in "${_CS_ENV_BLOCKED_VARS[@]}"; do
+      [[ "$n" == "$b" ]] && _cs_env_blocked_found+=("$n")
+    done
+  done
+  return 0
+}
+
+# Unset whatever the previously loaded profile.env exported. Driven by the
+# exported _CS_PROFILE_ENV_VARS recorded at load time, NOT by re-reading the
+# file: the file can be edited or deleted between `cs use` and `cs off`, and
+# re-parsing it then would leave the stale vars set forever.
+_cs_clear_profile_env() {
+  [[ -n "${_CS_PROFILE_ENV_VARS:-}" ]] || return 0
+  local v
+  # Unquoted command substitution field-splits in both zsh and bash. Var names
+  # are validated at parse time, so splitting on whitespace is safe here.
+  # shellcheck disable=SC2046
+  for v in $(printf '%s' "$_CS_PROFILE_ENV_VARS"); do
+    unset "$v"
+  done
+  unset _CS_PROFILE_ENV_VARS
+  return 0
+}
+
+# Source a profile's env file into the CURRENT shell and record what it set.
+_cs_load_profile_env() {
+  _cs_env_var_names=()
+  local f
+  f="$(_cs_profile_env_file "$1")"
+  [[ -f "$f" ]] || return 0
+
+  # Sourcing is running code. Refuse a file anyone but the owner can write: a
+  # shared profiles directory, or one with loose permissions, would otherwise be
+  # a way into every shell that pins this profile.
+  #
+  # `find -L` on purpose: without it find reports the SYMLINK's own mode, and a
+  # symlink is 0777 on Linux and 0755 on macOS regardless of its target. The
+  # guard would then wave through a link pointing at a world-writable file.
+  if [[ -n "$(find -L "$f" -maxdepth 0 \( -perm -g+w -o -perm -o+w \) 2>/dev/null)" ]]; then
+    echo "cs: refusing to load $f — it is group- or world-writable." >&2
+    echo "    Fix it with: chmod 600 '$f'" >&2
+    return 1
+  fi
+
+  _cs_parse_env_vars "$f"
+
+  _cs_env_find_blocked
+  if ((${#_cs_env_blocked_found})); then
+    echo "cs: refusing to load $f — it sets ${_cs_env_blocked_found[*]}." >&2
+    echo "    'cs off' unsets every name cs tracks, so managing these would break" >&2
+    echo "    your shell or the profile pin itself. Remove those lines." >&2
+    _cs_env_var_names=()
+    return 1
+  fi
+
+  # Record the names BEFORE sourcing, not after. `source` returns the exit
+  # status of the file's LAST command, so an ordinary trailing line such as
+  #     [[ -d "$HOME/work" ]] && export EXTRA=1
+  # returns non-zero whenever that test fails — with every earlier export
+  # already applied. Tracking afterwards would skip the record and strand those
+  # variables set-but-untracked forever, which is precisely the cross-profile
+  # drift this feature exists to stop.
+  ((${#_cs_env_var_names})) && export _CS_PROFILE_ENV_VARS="${_cs_env_var_names[*]}"
+
+  # shellcheck source=/dev/null
+  if ! source "$f"; then
+    echo "cs: $f returned a non-zero status. Its exports are still tracked, so" >&2
+    echo "    'cs off' will clear them — but check the file for a failing line." >&2
+    return 1
+  fi
+  return 0
 }
 
 # sha256 -> first 8 hex chars. This mirrors how Claude Code names the keychain
@@ -338,10 +495,38 @@ _cs_use() {
     return 1
   }
 
+  # Drop the OUTGOING profile's env before installing the new one. Without this,
+  # `cs use a` then `cs use b` leaves a's CLOUDSDK_CONFIG (or AWS_PROFILE, or
+  # KUBECONFIG) pointing at a's identity while the shell claims to be b — the
+  # exact cross-contamination this tool exists to prevent.
+  _cs_clear_profile_env
+
   export _CS_PROFILE="$name"
   export CLAUDE_CONFIG_DIR="$cfg_dir"
   # Clear cs's own legacy artifact so it can't override the keychain login.
   unset CLAUDE_CODE_OAUTH_TOKEN
+
+  # Load profile.env BEFORE the override-var check below, so a profile.env that
+  # sets ANTHROPIC_API_KEY (or Bedrock/Vertex, or ANTHROPIC_BASE_URL) gets the
+  # same warning as one the user exported by hand.
+  _cs_load_profile_env "$name"
+  local env_rc=$?
+  # Non-empty here means profile.env set it, since it was unset a moment ago.
+  # Honoring it would defeat the per-profile keychain isolation.
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    echo "cs: note — profile.env set CLAUDE_CODE_OAUTH_TOKEN; ignoring it (the keychain login wins)." >&2
+    unset CLAUDE_CODE_OAUTH_TOKEN
+  fi
+
+  # Re-assert the pin. _cs_load_profile_env rejects a file that EXPORTS these,
+  # but the file is sourced, so arbitrary code in it can still assign them (a
+  # bare `CLAUDE_CONFIG_DIR=...` updates the already-exported variable). Claiming
+  # a pin we no longer hold is the worst outcome available here, so check.
+  if [[ "${CLAUDE_CONFIG_DIR:-}" != "$cfg_dir" || "${_CS_PROFILE:-}" != "$name" ]]; then
+    echo "cs: note — profile.env moved the pin; restoring it to '$name'." >&2
+    export _CS_PROFILE="$name"
+    export CLAUDE_CONFIG_DIR="$cfg_dir"
+  fi
 
   # Other overriding auth vars (API key, custom headers, Bedrock/Vertex) belong
   # to the user's shell — don't silently unset them, but warn: the `claude`
@@ -359,6 +544,12 @@ _cs_use() {
 
   _cs_warn_note_vars
 
+  # Name what the env file pinned. The whole point is that one command moved
+  # more than Claude Code, so the user should be able to see it happen. Only
+  # claim success when the load actually succeeded — announcing "applied" right
+  # after an error message reads as though the error did not matter.
+  ((env_rc == 0 && ${#_cs_env_var_names})) && echo "cs: profile.env applied — ${_cs_env_var_names[*]}"
+
   local email cred
   email="$(_cs_profile_email "$name")"
   if _cs_profile_is_set_up "$name"; then
@@ -375,12 +566,17 @@ _cs_use() {
   else
     echo "cs: this shell pinned to '$name' (not logged in yet — run: cs login $name)."
   fi
+
+  # The pin above always succeeds, but a refused or failing profile.env must not
+  # be swallowed: `cs use work && terraform apply` would otherwise run against
+  # whichever cloud identity the shell already carried.
+  return "$env_rc"
 }
 
 # Run claude under a profile without pinning the shell and without going through
 # the `claude` wrapper — `env` executes the real binary, so a `claude` function
 # from another plugin is neither consulted nor clobbered. This is the escape
-# hatch for anyone who would rather claude-switch not own the `claude` name.
+# hatch for anyone who would rather context-switch not own the `claude` name.
 _cs_run() {
   local name="${1:-}"
   [[ -z "$name" ]] && {
@@ -407,21 +603,35 @@ _cs_run() {
     echo "cs: the claude CLI is not installed (or not in PATH)." >&2
     return 1
   }
-  _cs_warn_note_vars
-  _cs_build_scrub_args
-  # Keep the child environment internally consistent when the calling shell is
-  # already pinned to another profile. Nested shells inherit both variables.
-  env "${_cs_scrub[@]}" _CS_PROFILE="$name" CLAUDE_CONFIG_DIR="$cfg_dir" claude "$@"
+  # Run in a subshell so the profile's env file reaches the child WITHOUT
+  # pinning the caller's shell — `cs run` promises not to change this terminal.
+  (
+    # Clear the CALLER's profile env first, for the same reason `cs use` does.
+    # Running `cs run home` from a shell pinned to `work` otherwise hands the
+    # child work's CLOUDSDK_CONFIG while claude runs as home. The common case is
+    # worse still: when the target profile has no profile.env of its own,
+    # nothing would overwrite the caller's variables at all.
+    _cs_clear_profile_env
+    # A bad env file is reported, not fatal: claude's own isolation comes from
+    # CLAUDE_CONFIG_DIR, which is set below regardless.
+    _cs_load_profile_env "$name"
+    _cs_warn_note_vars
+    _cs_build_scrub_args
+    # Keep the child environment internally consistent when the calling shell is
+    # already pinned to another profile. Nested shells inherit both variables.
+    env "${_cs_scrub[@]}" _CS_PROFILE="$name" CLAUDE_CONFIG_DIR="$cfg_dir" claude "$@"
+  )
 }
 
 _cs_off() {
+  _cs_clear_profile_env
   unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE
   echo "cs: this shell unpinned (profile env cleared)."
 }
 
 _cs_list() {
   setopt local_options null_glob
-  local root f name marker email found=0 cred=0
+  local root f name marker email envmark found=0 cred=0
   root="$(_cs_profiles_root)"
   for f in "$root"/*; do
     [[ -d "$f" ]] || continue
@@ -429,6 +639,10 @@ _cs_list() {
     name="${f:t}"
     marker="  "
     [[ "$name" == "${_CS_PROFILE:-}" ]] && marker="* "
+    # Flag profiles that pin other tools too, so `cs list` shows the full scope
+    # of what `cs use <name>` will change.
+    envmark=""
+    [[ -f "$(_cs_profile_env_file "$name")" ]] && envmark=" [+env]"
     if _cs_profile_is_set_up "$name"; then
       email="$(_cs_profile_email "$name")"
       # Only contradict the config when we positively confirmed the credential
@@ -436,12 +650,12 @@ _cs_list() {
       _cs_profile_has_credential "$name"
       cred=$?
       if ((cred == 1)); then
-        echo "${marker}${name} — ${email} (no credential — run: cs login $name)"
+        echo "${marker}${name} — ${email}${envmark} (no credential — run: cs login $name)"
       else
-        echo "${marker}${name} — ${email}"
+        echo "${marker}${name} — ${email}${envmark}"
       fi
     else
-      echo "${marker}${name} — incomplete (run: cs login $name)"
+      echo "${marker}${name} — incomplete${envmark} (run: cs login $name)"
     fi
   done
   ((found)) || echo "(no profiles — run: cs login <name>)"
@@ -457,6 +671,47 @@ _cs_current() {
     return 0
   fi
   echo "(none — claude will use the default config)"
+}
+
+# Show a profile's env file: where it lives, and what it sets. Read-only on
+# purpose — the file is yours to edit with your own editor.
+_cs_env() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && {
+    echo "cs env <name>" >&2
+    return 1
+  }
+  _cs_validate_name "$name" || {
+    echo "cs: invalid profile name '$name'" >&2
+    return 1
+  }
+  local cfg_dir f
+  cfg_dir="$(_cs_profile_config_dir "$name")"
+  [[ -d "$cfg_dir" ]] || {
+    echo "cs: profile '$name' is not set up. Run: cs login $name" >&2
+    return 1
+  }
+  f="$(_cs_profile_env_file "$name")"
+  echo "$f"
+  if [[ -f "$f" ]]; then
+    echo ""
+    cat "$f"
+    return 0
+  fi
+  echo ""
+  echo "(no env file yet — create it with one 'export VAR=value' per line, e.g.)" >&2
+  cat >&2 <<EOF
+
+  cat > '$f' <<'ENV'
+  export CLOUDSDK_CONFIG="\$HOME/.config/gcloud-profiles/$name"
+  export GOOGLE_APPLICATION_CREDENTIALS="\$HOME/.config/gcloud-profiles/$name/application_default_credentials.json"
+  export AWS_PROFILE=$name
+  export KUBECONFIG="\$HOME/.kube/$name.yaml"
+  export GH_CONFIG_DIR="\$HOME/.config/gh-profiles/$name"
+ENV
+  chmod 600 '$f'
+EOF
+  return 0
 }
 
 _cs_rm() {
@@ -551,6 +806,7 @@ _cs_rm() {
     fi
   fi
   if [[ "${_CS_PROFILE:-}" == "$name" ]]; then
+    _cs_clear_profile_env
     unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE
   fi
   echo "cs: removed '$name'."
@@ -665,12 +921,14 @@ _cs_doctor() {
 
 _cs_help() {
   cat <<'EOF'
-cs — per-terminal Claude Code account switcher.
+cs — per-terminal identity switcher for Claude Code and your other CLIs.
 
 Usage:
   cs login <name> [claude auth login args...]
                     Log a full claude.ai account into an isolated profile.
-  cs use <name>     Pin THIS shell to a profile (exports CLAUDE_CONFIG_DIR).
+  cs use <name>     Pin THIS shell to a profile: exports CLAUDE_CONFIG_DIR, then
+                    sources the profile's profile.env (see below).
+  cs env <name>     Print the path and contents of the profile's env file.
   cs run <name> [--] [args...]
                     Run claude once under a profile without pinning the shell.
                     Bypasses the `claude` wrapper entirely, so it is also the
@@ -692,6 +950,25 @@ Daily use:
   cs use work && claude      # terminal A
   cs use personal && claude  # terminal B
 
+Pinning other tools (profile.env):
+  Write ~/.claude/profiles/<name>/profile.env with one export per line:
+
+    export CLOUDSDK_CONFIG="$HOME/.config/gcloud-profiles/work"
+    export GOOGLE_APPLICATION_CREDENTIALS="$CLOUDSDK_CONFIG/application_default_credentials.json"
+    export AWS_PROFILE=work
+    export KUBECONFIG="$HOME/.kube/work.yaml"
+
+  `cs use work` then sources it, so the whole terminal is one identity. `cs off`
+  and `cs use <other>` unset exactly the names that file exported.
+
+  gcloud is the clearest case. Its active_config and its application default
+  credentials are single global files, so `gcloud auth login` in one terminal
+  changes the account and the Terraform credentials in every other terminal.
+  Point CLOUDSDK_CONFIG at a per-profile directory and that stops. Set
+  GOOGLE_APPLICATION_CREDENTIALS too: Go tools such as the Terraform google
+  provider may not read CLOUDSDK_CONFIG, but every Google auth library reads
+  GOOGLE_APPLICATION_CREDENTIALS.
+
 The golden rule:
   One account -> one profile, and always `cs use` before `claude`. Claude Code
   now isolates credentials per CLAUDE_CONFIG_DIR (a keychain entry keyed by the
@@ -705,6 +982,13 @@ Caveats:
     CLAUDE_CONFIG_DIR. This is a CLI-only feature.
   - Two concurrent sessions of the SAME profile still share one credential
     slot; heavy parallel use of one account can still rotate against itself.
+  - profile.env tracking understands `export VAR=value` lines only. Other shell
+    code in that file still runs, but `cs off` cannot undo it.
+  - `cs off` UNSETS a tracked name; it does not restore what your shell held
+    before `cs use`.
+  - cs refuses a profile.env that exports PATH, HOME, IFS, PWD, OLDPWD, SHELL,
+    TMPDIR, CLAUDE_CONFIG_DIR, _CS_PROFILE, or _CS_PROFILE_ENV_VARS. The first
+    group would break the shell when `cs off` unsets it; the rest are the pin.
 EOF
 }
 
@@ -732,6 +1016,7 @@ cs() {
   list | ls) _cs_list "$@" ;;
   doctor | check) _cs_doctor "$@" ;;
   current) _cs_current "$@" ;;
+  env) _cs_env "$@" ;;
   rm) _cs_rm "$@" ;;
   help | -h | --help | "") _cs_help ;;
   *)
@@ -787,7 +1072,7 @@ claude() {
 
 _cs_source_diagnostics() {
   if [[ "$_CS_FOREIGN_CLAUDE" == "saved" ]]; then
-    echo "cs: note — a 'claude' function was already defined in this shell; claude-switch" >&2
+    echo "cs: note — a 'claude' function was already defined in this shell; context-switch" >&2
     echo "    replaced it with its profile-aware wrapper. The previous definition is kept" >&2
     echo "    as '_cs_prev_claude' (restore with: functions[claude]=\$functions[_cs_prev_claude])." >&2
     echo "    To bypass the wrapper entirely, use: cs run <name> -- <args>" >&2
@@ -797,7 +1082,7 @@ _cs_source_diagnostics() {
     echo "cs: WARNING — a 'claude' function was already defined in this shell and could" >&2
     echo "    NOT be preserved (this zsh does not support 'functions -c'). It has been" >&2
     echo "    REPLACED and the previous definition is LOST for this shell. Re-open a" >&2
-    echo "    shell without sourcing claude-switch to get it back." >&2
+    echo "    shell without sourcing context-switch to get it back." >&2
   fi
 
   # jq is a hard requirement of install.sh, but plugin managers (zinit, oh-my-zsh,

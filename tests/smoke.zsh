@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# claude-switch smoke tests.
+# context-switch smoke tests.
 # Runs in a sandboxed $HOME with a fake claude binary on PATH so no real
 # Claude Code state or keychain is touched. Every test is independent — setup
 # creates a fresh sandbox, teardown deletes it.
@@ -140,17 +140,22 @@ fi
 # record which overriding auth vars were present at launch so scrub is testable
 printf 'API=%s TOKEN=%s BEDROCK=%s VERTEX=%s\n' "${ANTHROPIC_API_KEY-}" "${CLAUDE_CODE_OAUTH_TOKEN-}" "${CLAUDE_CODE_USE_BEDROCK-}" "${CLAUDE_CODE_USE_VERTEX-}" >"${HOME}/.claude-launch-env"
 printf 'PROFILE=%s CONFIG=%s\n' "${_CS_PROFILE-}" "${CLAUDE_CONFIG_DIR-}" >"${HOME}/.claude-launch-profile"
+# record a plain (non-auth) var so profile.env propagation is testable
+printf 'TOOLVAR=%s\n' "${CS_TEST_TOOL-}" >"${HOME}/.claude-launch-toolvar"
 printf 'FAKE_CLAUDE: %s\n' "$*"
 SH
   chmod +x "$SANDBOX/bin/claude"
   export PATH="$SANDBOX/bin:$PATH"
 
-  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE \
-    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX 2>/dev/null
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE _CS_PROFILE_ENV_VARS \
+    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO 2>/dev/null
   unfunction cs claude _cs_prev_claude _cs_validate_name _cs_profiles_root \
     _cs_profile_config_dir _cs_sha256_8 _cs_keychain_service _cs_profile_email \
     _cs_profile_is_set_up _cs_profile_has_credential _cs_keychain_scheme_intact \
     _cs_build_scrub_args _cs_find_legacy_files _cs_warn_note_vars \
+    _cs_profile_env_file _cs_parse_env_vars _cs_clear_profile_env \
+    _cs_load_profile_env _cs_env _cs_env_find_blocked \
     _cs_source_diagnostics _cs_login _cs_login_cleanup _cs_use _cs_run _cs_off \
     _cs_list _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
   _CS_KC_SCHEME_CACHE=""
@@ -159,8 +164,9 @@ SH
 
 teardown() {
   [[ -n "${SANDBOX:-}" && -d "$SANDBOX" ]] && rm -rf "$SANDBOX"
-  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE SANDBOX \
-    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX 2>/dev/null
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE _CS_PROFILE_ENV_VARS SANDBOX \
+    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO 2>/dev/null
   PATH="${PATH#*:}"
 }
 
@@ -172,6 +178,15 @@ seed_profile() {
   cat >"$cfg_dir/.claude.json" <<JSON
 {"oauthAccount":{"emailAddress":"$email","organizationUuid":"org-$name"}}
 JSON
+}
+
+# Write a profile.env for an already-seeded profile. Body is passed verbatim.
+seed_profile_env() {
+  local name="$1" body="$2"
+  local f="$HOME/.claude/profiles/$name/profile.env"
+  mkdir -p "${f:h}"
+  printf '%s\n' "$body" >"$f"
+  chmod 600 "$f"
 }
 
 # Install a fake `security` that reports exactly the service names listed in
@@ -731,6 +746,259 @@ t_rm_pinned_clears_env() {
   teardown
 }
 
+t_profile_env_applied_on_use() {
+  echo "[profile.env: applied and tracked on use]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one
+export CS_TEST_TWO="two"'
+  # Redirect rather than capture: $(...) is a subshell, so exports made by
+  # `cs use` would never reach this shell and every assertion below would lie.
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "reports what it applied" "$out" "profile.env applied"
+  assert_contains "names the first var" "$out" "CS_TEST_ONE"
+  assert_contains "names the second var" "$out" "CS_TEST_TWO"
+  assert_eq "first var exported" "${CS_TEST_ONE:-}" "one"
+  assert_eq "second var exported" "${CS_TEST_TWO:-}" "two"
+  assert_eq "tracked names recorded" "${_CS_PROFILE_ENV_VARS:-}" "CS_TEST_ONE CS_TEST_TWO"
+  zsh -c '[[ "$CS_TEST_ONE" == "one" ]]'
+  assert_eq "vars reach child shells" "$?" "0"
+  teardown
+}
+
+t_profile_env_swapped_between_profiles() {
+  echo "[profile.env: switching profiles does not leak the old one]"
+  setup
+  seed_profile personal
+  seed_profile work work@corp.com
+  seed_profile_env personal 'export CS_TEST_ONE=personal'
+  seed_profile_env work 'export CS_TEST_TWO=work'
+  cs use personal >/dev/null 2>&1
+  assert_eq "personal var set" "${CS_TEST_ONE:-}" "personal"
+  cs use work >/dev/null 2>&1
+  assert_eq "personal var gone after switch" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "work var set" "${CS_TEST_TWO:-}" "work"
+  assert_eq "tracked names replaced" "${_CS_PROFILE_ENV_VARS:-}" "CS_TEST_TWO"
+  # A profile with no env file must still clear the previous profile's vars.
+  seed_profile bare bare@example.com
+  cs use bare >/dev/null 2>&1
+  assert_eq "work var gone after bare profile" "${CS_TEST_TWO:-_NONE_}" "_NONE_"
+  assert_eq "tracking cleared" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_cleared_on_off_and_rm() {
+  echo "[profile.env: cleared by off, deleted by rm]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one'
+  cs use personal >/dev/null 2>&1
+  cs off >/dev/null 2>&1
+  assert_eq "off unsets the var" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "off clears tracking" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "_NONE_"
+
+  cs use personal >/dev/null 2>&1
+  printf 'y\n' | cs rm personal >/dev/null 2>&1
+  assert_file_absent "rm deletes the env file" "$HOME/.claude/profiles/personal/profile.env"
+  assert_eq "rm unsets the var" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "rm clears tracking" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_tracks_despite_failing_last_line() {
+  echo "[profile.env: a failing last line must not strand exported vars]"
+  setup
+  seed_profile personal
+  # `source` returns the status of the file's LAST command, so this ordinary
+  # trailing guard makes the whole load return non-zero — with CS_TEST_ONE and
+  # CS_TEST_TWO already exported.
+  seed_profile_env personal 'export CS_TEST_ONE=one
+export CS_TEST_TWO=two
+[[ -d /no/such/directory ]] && export CS_TEST_TOOL=three'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_eq "vars were exported" "${CS_TEST_ONE:-}" "one"
+  # The trailing conditional does not start with `export`, so it falls outside
+  # the documented contract and is not tracked. The plain exports above it are —
+  # that is the regression this test guards.
+  assert_eq "plain exports tracked anyway" "${_CS_PROFILE_ENV_VARS:-}" "CS_TEST_ONE CS_TEST_TWO"
+  assert_contains "reports the failing file" "$out" "returned a non-zero status"
+  assert_not_contains "does not claim success" "$out" "profile.env applied"
+  cs off >/dev/null 2>&1
+  assert_eq "off clears the first" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "off clears the second" "${CS_TEST_TWO:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_refuses_blocked_names() {
+  echo "[profile.env: refuses names that would break the shell or the pin]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one
+export PATH="/nowhere:$PATH"'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out saved_path="$PATH"
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "names the offending variable" "$out" "it sets PATH"
+  assert_eq "nothing from the file applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "nothing tracked" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "_NONE_"
+  assert_eq "PATH untouched" "$PATH" "$saved_path"
+  assert_eq "still pinned" "${_CS_PROFILE:-}" "personal"
+
+  # The pin variables are blocked for the same reason.
+  seed_profile_env personal 'export CLAUDE_CONFIG_DIR=/tmp/elsewhere'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "blocks the pin variable" "$out" "it sets CLAUDE_CONFIG_DIR"
+  assert_eq "config dir still correct" "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude/profiles/personal"
+  teardown
+}
+
+t_profile_env_pin_survives_bare_assignment() {
+  echo "[profile.env: a bare assignment cannot move the pin]"
+  setup
+  seed_profile personal
+  # No `export`, so the blocked-name parser does not see it — but the variable
+  # is already exported, so the assignment still changes it.
+  seed_profile_env personal 'CLAUDE_CONFIG_DIR=/tmp/elsewhere'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "reports the correction" "$out" "moved the pin"
+  assert_eq "config dir restored" "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude/profiles/personal"
+  assert_eq "profile restored" "${_CS_PROFILE:-}" "personal"
+  teardown
+}
+
+t_profile_env_use_reports_failure_status() {
+  echo "[profile.env: cs use exits non-zero when the env file is refused]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one'
+  cs use personal >/dev/null 2>&1
+  assert_eq "healthy file exits 0" "$?" "0"
+  chmod 666 "$HOME/.claude/profiles/personal/profile.env"
+  cs use personal >/dev/null 2>&1
+  assert_eq "refused file exits non-zero" "$?" "1"
+  teardown
+}
+
+t_profile_env_symlink_permissions_checked() {
+  echo "[profile.env: the writability guard follows a symlink]"
+  setup
+  seed_profile personal
+  local target="$SANDBOX/exposed.env"
+  printf 'export CS_TEST_ONE=one\n' >"$target"
+  chmod 666 "$target"
+  ln -s "$target" "$HOME/.claude/profiles/personal/profile.env"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "refuses the symlinked file" "$out" "group- or world-writable"
+  assert_eq "var not exported" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_tracks_multiple_exports_per_line() {
+  echo "[profile.env: two exports on one line are both tracked]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one CS_TEST_TWO=two'
+  cs use personal >/dev/null 2>&1
+  assert_eq "both applied" "${CS_TEST_ONE:-}/${CS_TEST_TWO:-}" "one/two"
+  assert_eq "both tracked" "${_CS_PROFILE_ENV_VARS:-}" "CS_TEST_ONE CS_TEST_TWO"
+  cs off >/dev/null 2>&1
+  assert_eq "both cleared" "${CS_TEST_ONE:-_NONE_}/${CS_TEST_TWO:-_NONE_}" "_NONE_/_NONE_"
+
+  # A quoted value may contain a decoy "WORD=" that is not a variable.
+  teardown
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE="a CS_TEST_TWO=decoy"'
+  cs use personal >/dev/null 2>&1
+  assert_eq "decoy not tracked" "${_CS_PROFILE_ENV_VARS:-}" "CS_TEST_ONE"
+  assert_eq "decoy not exported" "${CS_TEST_TWO:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_run_clears_caller_env() {
+  echo "[profile.env: cs run does not leak the caller's profile into the child]"
+  setup
+  seed_profile work work@corp.com
+  seed_profile home home@example.com
+  seed_profile_env work 'export CS_TEST_TOOL=fromwork'
+  # `home` deliberately has NO profile.env — the caller's value must still go.
+  cs use work >/dev/null 2>&1
+  cs run home -- --version >/dev/null 2>&1
+  assert_eq "child did not inherit work's var" "$(<"$HOME/.claude-launch-toolvar")" "TOOLVAR="
+  assert_eq "caller keeps its own pin" "${_CS_PROFILE:-}" "work"
+  assert_eq "caller keeps its own var" "${CS_TEST_TOOL:-}" "fromwork"
+  teardown
+}
+
+t_profile_env_refuses_world_writable() {
+  echo "[profile.env: refuses a file others can write]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one'
+  chmod 666 "$HOME/.claude/profiles/personal/profile.env"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "explains the refusal" "$out" "group- or world-writable"
+  assert_eq "var not exported" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  # The Claude pin must still succeed — a bad env file is not a reason to leave
+  # the shell pointing at the previous account.
+  assert_eq "still pinned to the profile" "${_CS_PROFILE:-}" "personal"
+  teardown
+}
+
+t_profile_env_reaches_run_without_pinning() {
+  echo "[profile.env: cs run passes it to the child, leaves the shell alone]"
+  setup
+  seed_profile work work@corp.com
+  seed_profile_env work 'export CS_TEST_TOOL=fromwork'
+  cs run work -- --version >/dev/null 2>&1
+  assert_eq "child saw the var" "$(<"$HOME/.claude-launch-toolvar")" "TOOLVAR=fromwork"
+  assert_eq "caller shell not given the var" "${CS_TEST_TOOL:-_NONE_}" "_NONE_"
+  assert_eq "caller shell not pinned" "${_CS_PROFILE:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_env_subcommand() {
+  echo "[env: prints the path and contents]"
+  setup
+  seed_profile personal
+  local out
+  out="$(cs env personal 2>&1)"
+  assert_contains "prints the path" "$out" "profiles/personal/profile.env"
+  assert_contains "offers a template when absent" "$out" "no env file yet"
+  seed_profile_env personal 'export CS_TEST_ONE=one'
+  out="$(cs env personal 2>&1)"
+  assert_contains "prints the contents" "$out" "export CS_TEST_ONE=one"
+  out="$(cs env ghost 2>&1)"
+  assert_contains "missing profile" "$out" "not set up"
+  out="$(cs env ../foo 2>&1)"
+  assert_contains "rejects traversal" "$out" "invalid profile name"
+  teardown
+}
+
+t_list_marks_env_profiles() {
+  echo "[list: flags profiles that pin other tools]"
+  setup
+  seed_profile personal
+  seed_profile work work@corp.com
+  seed_profile_env work 'export CS_TEST_ONE=one'
+  local out
+  out="$(cs list 2>&1)"
+  assert_contains "work marked" "$out" "work@corp.com [+env]"
+  assert_not_contains "personal not marked" "$out" "personal@example.com [+env]"
+  teardown
+}
+
 t_doctor_healthy_and_duplicate() {
   echo "[doctor: healthy profiles + duplicate-account detection]"
   setup
@@ -869,6 +1137,20 @@ t_resource_preserves_profile
 t_rm
 t_rm_legacy_credentials
 t_rm_pinned_clears_env
+t_profile_env_applied_on_use
+t_profile_env_swapped_between_profiles
+t_profile_env_cleared_on_off_and_rm
+t_profile_env_tracks_despite_failing_last_line
+t_profile_env_refuses_blocked_names
+t_profile_env_pin_survives_bare_assignment
+t_profile_env_use_reports_failure_status
+t_profile_env_symlink_permissions_checked
+t_profile_env_tracks_multiple_exports_per_line
+t_profile_env_run_clears_caller_env
+t_profile_env_refuses_world_writable
+t_profile_env_reaches_run_without_pinning
+t_env_subcommand
+t_list_marks_env_profiles
 t_doctor_healthy_and_duplicate
 t_doctor_default_duplicate
 t_doctor_not_logged_in

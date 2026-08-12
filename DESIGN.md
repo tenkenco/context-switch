@@ -6,12 +6,16 @@ This document explains the reasoning behind the implementation: what we tried, w
 ## Goal
 
 I had enough of switching accounts whenever my Claude limit was reached.
-The goal of `claude-switch` is to make concurrent account switching a touch
+The goal of `context-switch` is to make concurrent account switching a touch
 more bearable than logging into different MFA-enabled Google accounts
 manually.
 
 The goal is to make sure there's no silent identity drift, no background
 daemons to babysit, and no brittle interception layer.
+
+The same problem turned out to be general. Claude Code is one tool among many
+that keeps its identity in a global file. So the tool now pins other CLIs too.
+See [Generalizing past Claude Code](#generalizing-past-claude-code) below.
 
 ## Where identity state actually lives
 
@@ -97,6 +101,105 @@ The fix is a usage rule, not code: **one account, one profile; always `cs use`
 before `claude`.** `cs doctor` enforces it by reporting the account behind every
 namespace (including the default) and failing if any account appears twice.
 
+## Generalizing past Claude Code
+
+Claude Code is not special here. Most CLI tools read their config path from an
+environment variable, and store the active identity in one global file. The
+environment variable is the escape hatch, because environment variables are per
+process and children inherit them.
+
+gcloud is the sharpest example, and the reason this feature exists:
+
+- `~/.config/gcloud/active_config` names the active configuration. It is one
+  file for every shell, so `gcloud config configurations activate` and
+  `gcloud auth login` switch every terminal at once. Named configurations do
+  not help, because activation itself is global.
+- `~/.config/gcloud/application_default_credentials.json` holds the application
+  default credentials. `gcloud auth application-default login` overwrites it
+  with the newest account. The Terraform google provider reads that file, so a
+  login for one account breaks Terraform runs for the other.
+
+`CLOUDSDK_CONFIG` moves both files into a per-profile directory, which removes
+the shared state entirely.
+
+### Why `profile.env` sets two variables for gcloud
+
+The recommended `profile.env` sets `CLOUDSDK_CONFIG` **and**
+`GOOGLE_APPLICATION_CREDENTIALS`. The gcloud CLI honors the first. Whether Go's
+application-default lookup honors it depends on the version of
+`golang.org/x/oauth2/google` compiled into the tool, and the Terraform google
+provider is Go. Every Google auth library honors
+`GOOGLE_APPLICATION_CREDENTIALS` unconditionally. Setting both makes the
+uncertain fact irrelevant.
+
+### Why a data file and not per-tool code
+
+A `profile.env` file makes adding a tool a data change, not a code change. The
+repository stays one small zsh file. Per-tool logic can move into
+`providers/*.zsh` later, if login or health-check behavior ever needs it.
+
+### What the tracking contract buys
+
+`cs` parses `export VAR=value` lines and records those names in
+`_CS_PROFILE_ENV_VARS` at load time. It then unsets exactly those names on
+`cs off`, and before applying a different profile.
+
+Clearing before `cs use` applies the next profile is the important case. Without
+it, `cs use work` after `cs use personal` would leave personal's
+`CLOUDSDK_CONFIG` in a shell that claims to be work. That is the identity drift
+this tool exists to prevent. `cs run` clears the caller's env for the same
+reason, inside its subshell, before it loads the target profile.
+
+Recording at load time is deliberate. Re-reading the file at unload time would
+strand variables whenever the file changed or was deleted in between.
+
+Recording happens *before* the file is sourced, which is subtler and matters
+more. `source` returns the exit status of the file's last command. An ordinary
+trailing line such as
+
+```sh
+[[ -d "$HOME/work-tools" ]] && export EXTRA=1
+```
+
+returns non-zero whenever that test fails — with every earlier export already
+applied. An implementation that recorded the names after a successful `source`
+would skip the record on exactly that file, and leave those variables set and
+untracked forever. An ordering mistake would reintroduce the same drift.
+
+### The refused-names list
+
+`cs` rejects a `profile.env` outright when it exports `PATH`, `HOME`, `IFS`,
+`PWD`, `OLDPWD`, `SHELL`, `TMPDIR`, `CLAUDE_CONFIG_DIR`, `_CS_PROFILE`, or
+`_CS_PROFILE_ENV_VARS`.
+
+The reason is the clearing rule above. `cs off` unsets every tracked name, so
+tracking `PATH` would leave a shell that cannot run a single command. The last
+three name the pin, so a file that sets them could make `cs use` report one
+profile while `claude` launches as another.
+
+Rejecting the whole file beats ignoring one line. A partly applied file leaves
+the user with an identity they did not ask for and no error to explain it.
+
+`cs use` also re-asserts `CLAUDE_CONFIG_DIR` and `_CS_PROFILE` after sourcing.
+The refused-names check reads `export` lines, but the file is sourced, so a bare
+`CLAUDE_CONFIG_DIR=...` assignment still updates the already-exported variable.
+Arbitrary code in a sourced file cannot be fully contained; re-asserting the two
+values cs actually knows is cheap and closes the case that matters.
+
+### Why profiles stay under `~/.claude/profiles`
+
+The path is now a misnomer, and it stays anyway. Claude Code names each keychain
+entry after `sha256(CLAUDE_CONFIG_DIR)`. Moving the profiles directory changes
+every hash, orphans every stored credential, and forces a re-login for every
+profile. The cosmetic gain is not worth that.
+
+### Sourcing is running code
+
+`cs use` sources `profile.env`, so the file executes with your shell's
+privileges. `cs` refuses to source a file that is group- or world-writable. It
+does not sandbox the contents, because a file in your own home directory offers
+no meaningful boundary to sandbox against. Keep the file to plain exports.
+
 ## Out of scope
 
 - local HTTP proxy for refresh interception
@@ -130,4 +233,4 @@ CLAUDE_CONFIG_DIR="$HOME/.claude/profiles/work"     claude auth status --json
 ```
 
 If the suffix no longer matches, or two config dirs collapse to one account,
-`claude-switch` (and `cs doctor`) may need an update.
+`context-switch` (and `cs doctor`) may need an update.
