@@ -155,7 +155,7 @@ SH
     _cs_profile_is_set_up _cs_profile_has_credential _cs_keychain_scheme_intact \
     _cs_build_scrub_args _cs_find_legacy_files _cs_warn_note_vars \
     _cs_profile_env_file _cs_parse_env_vars _cs_clear_profile_env \
-    _cs_load_profile_env _cs_env _cs_env_find_blocked \
+    _cs_load_profile_env _cs_env _cs_env_find_blocked _cs_env_path_unsafe \
     _cs_source_diagnostics _cs_login _cs_login_cleanup _cs_use _cs_run _cs_off \
     _cs_list _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
   _CS_KC_SCHEME_CACHE=""
@@ -902,6 +902,45 @@ t_profile_env_symlink_permissions_checked() {
   teardown
 }
 
+t_profile_env_refuses_writable_directory() {
+  echo "[profile.env: refuses a profile directory others can write]"
+  setup
+  seed_profile personal
+  # The FILE is immaculate. The DIRECTORY is not, so an attacker can delete the
+  # file and drop in their own 0600 copy that passes every check on the file.
+  seed_profile_env personal 'export CS_TEST_ONE=attacker'
+  chmod 777 "$HOME/.claude/profiles/personal"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "explains the directory is unsafe" "$out" "its directory"
+  assert_contains "names the permission problem" "$out" "group- or world-writable"
+  assert_eq "nothing from the file applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "still pinned" "${_CS_PROFILE:-}" "personal"
+  chmod 700 "$HOME/.claude/profiles/personal"
+  cs use personal >/dev/null 2>&1
+  assert_eq "loads once the directory is fixed" "${CS_TEST_ONE:-}" "attacker"
+  teardown
+}
+
+t_profile_env_clear_ignores_blocked_names() {
+  echo "[profile.env: cs off never unsets a protected name]"
+  setup
+  seed_profile personal
+  # _CS_PROFILE_ENV_VARS is exported, so it can reach this shell from a parent
+  # process or a stale session rather than from a file cs parsed. Honoring a
+  # PATH entry in it would leave a shell that cannot run a single command.
+  export _CS_PROFILE_ENV_VARS="PATH HOME CS_TEST_ONE"
+  export CS_TEST_ONE=one
+  local saved_path="$PATH"
+  cs off >/dev/null 2>&1
+  assert_eq "PATH survives" "$PATH" "$saved_path"
+  assert_not_eq "HOME survives" "${HOME:-}" ""
+  assert_eq "the ordinary name is still cleared" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "tracking cleared" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "_NONE_"
+  teardown
+}
+
 t_profile_env_tracks_multiple_exports_per_line() {
   echo "[profile.env: two exports on one line are both tracked]"
   setup
@@ -1145,6 +1184,8 @@ t_profile_env_refuses_blocked_names
 t_profile_env_pin_survives_bare_assignment
 t_profile_env_use_reports_failure_status
 t_profile_env_symlink_permissions_checked
+t_profile_env_refuses_writable_directory
+t_profile_env_clear_ignores_blocked_names
 t_profile_env_tracks_multiple_exports_per_line
 t_profile_env_run_clears_caller_env
 t_profile_env_refuses_world_writable

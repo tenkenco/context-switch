@@ -227,15 +227,44 @@ _cs_env_find_blocked() {
 # re-parsing it then would leave the stale vars set forever.
 _cs_clear_profile_env() {
   [[ -n "${_CS_PROFILE_ENV_VARS:-}" ]] || return 0
-  local v
+  local v b skip
   # Unquoted command substitution field-splits in both zsh and bash. Var names
   # are validated at parse time, so splitting on whitespace is safe here.
   # shellcheck disable=SC2046
   for v in $(printf '%s' "$_CS_PROFILE_ENV_VARS"); do
+    # Never unset a protected name, no matter what the tracking list says.
+    # _CS_PROFILE_ENV_VARS is exported, so it can arrive from a parent process
+    # or a stale session rather than from a file cs actually parsed. cs never
+    # writes a blocked name into it, so one appearing here did not come from us
+    # — and honoring `PATH` would leave a shell that cannot run a command.
+    skip=0
+    for b in "${_CS_ENV_BLOCKED_VARS[@]}"; do
+      [[ "$v" == "$b" ]] && skip=1
+    done
+    ((skip)) && continue
     unset "$v"
   done
   unset _CS_PROFILE_ENV_VARS
   return 0
+}
+
+# Is a path something an attacker could have written? Echoes the reason and
+# returns 0 when it is unsafe, so callers can report WHY they refused.
+#
+# Both checks follow symlinks on purpose. `-O` and `find -L` resolve the link,
+# and a link's own mode is 0777 on Linux and 0755 on macOS no matter what it
+# points at, so testing the link itself proves nothing.
+_cs_env_path_unsafe() {
+  local p="$1"
+  if [[ ! -O "$p" ]]; then
+    printf 'it is not owned by you'
+    return 0
+  fi
+  if [[ -n "$(find -L "$p" -maxdepth 0 \( -perm -g+w -o -perm -o+w \) 2>/dev/null)" ]]; then
+    printf 'it is group- or world-writable'
+    return 0
+  fi
+  return 1
 }
 
 # Source a profile's env file into the CURRENT shell and record what it set.
@@ -245,16 +274,25 @@ _cs_load_profile_env() {
   f="$(_cs_profile_env_file "$1")"
   [[ -f "$f" ]] || return 0
 
-  # Sourcing is running code. Refuse a file anyone but the owner can write: a
-  # shared profiles directory, or one with loose permissions, would otherwise be
-  # a way into every shell that pins this profile.
-  #
-  # `find -L` on purpose: without it find reports the SYMLINK's own mode, and a
-  # symlink is 0777 on Linux and 0755 on macOS regardless of its target. The
-  # guard would then wave through a link pointing at a world-writable file.
-  if [[ -n "$(find -L "$f" -maxdepth 0 \( -perm -g+w -o -perm -o+w \) 2>/dev/null)" ]]; then
-    echo "cs: refusing to load $f — it is group- or world-writable." >&2
+  # Sourcing is running code, so refuse anything an attacker could have written.
+  local why
+  if why="$(_cs_env_path_unsafe "$f")"; then
+    echo "cs: refusing to load $f — $why." >&2
     echo "    Fix it with: chmod 600 '$f'" >&2
+    return 1
+  fi
+
+  # The DIRECTORY matters as much as the file. Anyone who can write the profile
+  # directory can delete profile.env and drop in their own 0600 copy, which
+  # passes the check above with a perfect-looking mode. `cs login` creates the
+  # directory 0700, but a permissive umask, a restored backup, or a synced home
+  # can loosen it after the fact — and nothing else would ever notice.
+  local d
+  d="$(_cs_profile_config_dir "$1")"
+  if why="$(_cs_env_path_unsafe "$d")"; then
+    echo "cs: refusing to load $f — its directory $d is unsafe: $why." >&2
+    echo "    Anyone who can write that directory can replace the file." >&2
+    echo "    Fix it with: chmod 700 '$d'" >&2
     return 1
   fi
 

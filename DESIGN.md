@@ -196,9 +196,28 @@ profile. The cosmetic gain is not worth that.
 ### Sourcing is running code
 
 `cs use` sources `profile.env`, so the file executes with your shell's
-privileges. `cs` refuses to source a file that is group- or world-writable. It
-does not sandbox the contents, because a file in your own home directory offers
-no meaningful boundary to sandbox against. Keep the file to plain exports.
+privileges. `cs` refuses to source it unless you own it and only you can write
+it.
+
+`cs` applies the same check to the profile directory. Checking the file alone
+is not enough: anyone who can write the directory can delete `profile.env` and
+drop in their own `0600` copy, which then passes every check on the file. Both
+checks follow symlinks, because a symlink's own mode is `0777` on Linux and
+`0755` on macOS and says nothing about its target.
+
+`cs login` creates the profile directory `0700`, so this holds by default. The
+check exists for the cases that come later: a permissive umask, a restored
+backup, a synced home directory, or a stray `chmod -R`.
+
+`cs` does not sandbox the file's contents. A file in your own home directory
+offers no meaningful boundary to sandbox against. Keep the file to plain
+exports.
+
+`cs off` also refuses to unset a protected name, even when
+`_CS_PROFILE_ENV_VARS` names one. That variable is exported, so it can reach a
+shell from a parent process or a stale session rather than from a file `cs`
+parsed. `cs` never writes a protected name into it, so one appearing there did
+not come from `cs`.
 
 ## Out of scope
 

@@ -142,7 +142,12 @@ export KUBECONFIG="$HOME/.kube/work.yaml"
 export GH_CONFIG_DIR="$HOME/.config/gh-profiles/work"
 ```
 
-Run `chmod 600` on that file. `cs` refuses to source one that other users can write.
+Run `chmod 600` on that file. Sourcing runs code, so `cs` refuses the file unless you own it and only you can write it. `cs` checks the profile directory the same way, because anyone who can write that directory can replace the file with their own. `cs login` already creates the directory `0700`.
+
+```sh
+chmod 700 ~/.claude/profiles/work
+chmod 600 ~/.claude/profiles/work/profile.env
+```
 
 `cs use work` now sets all of it. `cs off` unsets it. `cs use personal` unsets it and applies personal's file instead. `cs list` marks profiles that carry one with `[+env]`.
 
