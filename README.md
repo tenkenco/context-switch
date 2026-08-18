@@ -136,6 +136,7 @@ cs list          # show profiles, * marks this shell's pin
 cs current       # what is this shell pinned to?
 cs env work      # show the profile's env file for other tools
 cs doctor        # verify logins, catch duplicate accounts, check providers
+cs version       # which release you are on
 cs off           # unpin this shell
 cs rm work       # delete a profile's config, keychain login, and tool credentials
 ```
@@ -431,6 +432,10 @@ export CS_QUIET=1
 
 Covers profile validation, login/use/off/list/current/env/rm/doctor flows, isolated config behavior, duplicate-account detection, wrapper behavior, `profile.env` load and cleanup, path-traversal guards, the provider grammar, and the gcloud provider's login and check hooks.
 CI runs this suite on both macOS and Ubuntu in `.github/workflows/test.yml`.
+
+## Changelog
+
+[CHANGELOG.md](CHANGELOG.md) lists what changed in each release. Run `cs version` to see which one you are on.
 
 ## Design notes
 
