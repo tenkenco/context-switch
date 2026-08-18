@@ -33,6 +33,7 @@ gcloud has a worse version of it. `~/.config/gcloud/active_config` and `~/.confi
 3. `cs use <name>` exports that same `CLAUDE_CONFIG_DIR` in the current shell only.
 4. `cs use <name>` then sources the profile's optional `profile.env`, which pins every other tool.
 5. `claude` launches using the pinned profile's credentials — no rewriting, no env tokens.
+6. `cs login <name> gcloud` logs a second tool into the same profile, using the path that `profile.env` names. See [Providers](#providers).
 
 ### The one rule that matters
 
@@ -40,7 +41,7 @@ gcloud has a worse version of it. `~/.config/gcloud/active_config` and `~/.confi
 
 Claude Code rotates OAuth refresh tokens: every refresh invalidates the previous refresh token. If the *same* account is logged into two credential slots — two profiles, or a profile **and** the unpinned default config — each refresh silently invalidates the other, and you get surprise `Please run /login` 401s. That is the single most common cause of "it made me log in again."
 
-Run `cs doctor` to catch it: it lists every namespace's account and flags any account that appears in more than one.
+Run `cs doctor` to catch it: it lists every namespace's account and flags any account that appears in more than one. It then asks every provider about the same profiles.
 
 ## Requirements
 
@@ -48,6 +49,7 @@ Run `cs doctor` to catch it: it lists every namespace's account and flags any ac
 - `zsh`
 - [Claude Code CLI](https://claude.com/claude-code) (2.x)
 - `jq` (`brew install jq` on macOS, `apt install jq` on Debian/Ubuntu)
+- The gcloud CLI, for the gcloud provider only. Everything else works without it.
 
 ## Install
 

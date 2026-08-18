@@ -1641,6 +1641,12 @@ t_doctor_gcloud_checks() {
   printf 'work@corp.com\n' >"$HOME/.gcloud-accounts"
   out="$(cs doctor 2>&1)"
   assert_contains "reports the account" "$out" "gcloud: work@corp.com"
+  assert_contains "names the missing project" "$out" "(no project set)"
+  printf 'my-project\n' >"$HOME/.gcloud-project"
+  out="$(cs doctor 2>&1)"
+  assert_contains "reports the project when set" "$out" "gcloud: work@corp.com (my-project)"
+  rm -f "$HOME/.gcloud-project"
+  out="$(cs doctor 2>&1)"
   assert_contains "reports the missing ADC file" "$out" "NO application default credentials"
   cs doctor >/dev/null 2>&1
   assert_eq "missing ADC exits 1" "$?" "1"

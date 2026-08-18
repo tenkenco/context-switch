@@ -10,6 +10,13 @@
 #   3. Pin a terminal to a profile:          cs use work
 #   4. Run claude in that terminal:          claude
 #
+# Providers:
+#   `cs login <profile> [provider]` logs one tool into a profile. The provider
+#   defaults to `claude`, so `cs login work` is unchanged; `cs login work gcloud`
+#   drives both gcloud logins into the directory that profile's profile.env
+#   names. `cs doctor` asks every provider about every profile, and `cs rm`
+#   deletes the directories a provider owns. See _CS_PROVIDERS.
+#
 # Other tools (profile.env):
 #   Each profile may hold a `profile.env` file. `cs use` sources it, so one
 #   command pins the whole toolchain — gcloud, AWS, kubectl, gh — not just
@@ -614,20 +621,16 @@ _cs_provider_list() { printf '%s' "${_CS_PROVIDERS[*]}"; }
 # the same reason it does there: running a gcloud login from a shell pinned to
 # `work` must not hand the child work's CLOUDSDK_CONFIG.
 #
-# Returns 2 when the profile.env could not be loaded. A provider hook must not
-# turn a broken or refused env file into "your gcloud login is wrong": those are
-# different problems with different fixes, and _cs_load_profile_env has already
-# said which one it hit.
+# Whether the profile.env loaded is reported in _cs_env_load_ok, NOT in the exit
+# status. A provider hook must not turn a broken or refused env file into "your
+# gcloud login is wrong": those are different problems with different fixes, and
+# _cs_load_profile_env has already said which one it hit.
 #
-# A marker file decides that, not the subshell's exit status. An exit status
-# cannot say it, because the command being run owns the whole range: gcloud uses
-# argparse, so `cs login work gcloud --bogus-flag` exits 2 for a usage error,
-# and reporting that as a broken profile.env sent the user to a file that was
-# fine. The marker is written only after the load succeeds, so a 2 that reaches
-# the caller with the marker present is the command's own 2.
-# Set by _cs_with_profile_env: 1 when the profile.env loaded, 0 when it did not.
-# A caller reads this INSTEAD of the exit status, because the status belongs to
-# the command that ran.
+# The status cannot carry it, because the command being run owns the whole
+# range. gcloud uses argparse, so `cs login work gcloud --bogus-flag` exits 2
+# for a usage error, and reporting that as a broken profile.env sent the user to
+# a file that was fine. The subshell writes a marker file after the load
+# succeeds; the parent reads the marker and passes the command's status through.
 typeset -g _cs_env_load_ok=0
 
 _cs_with_profile_env() {
@@ -773,7 +776,12 @@ _cs_gcloud_check_here() {
     echo "        cs use $name && gcloud auth revoke <account>" >&2
     bad=1
   else
-    echo "  $name — gcloud: $accounts ($(_cs_gcloud_project))"
+    # Say so when no project is set, rather than printing an empty "()".
+    # `gcloud config get-value project` writes "(unset)" to stderr and nothing
+    # to stdout, so the empty case is the normal one on a fresh profile.
+    local project
+    project="$(_cs_gcloud_project)"
+    echo "  $name — gcloud: $accounts (${project:-no project set})"
   fi
 
   # The second credential. Its absence is invisible to `gcloud auth list` and
