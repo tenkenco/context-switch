@@ -244,6 +244,42 @@ contains `..`, that is the home directory or an ancestor of it, that is a shared
 configuration directory such as `~/.config/gcloud`, or that is the profiles
 root. It names every path in the confirmation prompt before anything is deleted.
 
+### Why a hook owns standard output alone
+
+`_cs_with_profile_env` sources `profile.env` and then runs a hook in the same
+subshell. Both wrote to the same standard output, and `cs rm` reads a hook's
+standard output as a list of directories to delete.
+
+So a `profile.env` containing an ordinary `echo "$HOME/Documents"` put a real
+directory on the delete list, and the confirmation prompt described it as a
+credential. A `mkdir -pv`, a sourced helper, or a shell banner does the same.
+The file does not have to be hostile.
+
+The load now runs with its output redirected to standard error. The user still
+sees every line the file prints. A hook owns standard output alone, so the two
+can never be confused. The same fix stops a `profile.env` from writing a forged
+line into a `cs doctor` report.
+
+### Why the delete guard is containment, not a denylist
+
+A denylist can only refuse the paths someone thought of. The first version
+listed five, so it approved `~/.ssh`, `~/.aws`, and `/etc` for `rm -rf`.
+
+The guard now requires the path to sit under the home directory, at least two
+levels down, to be owned by the user, and to be writable by nobody else. A
+per-profile directory looks like `~/.config/gcloud-profiles/work`, which passes.
+A typo such as `~/.aws` sits one level down, which fails.
+
+It also refuses a symlink. The guard compares resolved paths, so without that
+rule a symlink planted in place of the directory would resolve to its target,
+and the target is what `rm -rf` would take. Only the final component is tested,
+because an ancestor symlink is ordinary: `/var` resolves to `/private/var` on
+macOS.
+
+The checks run twice, once when the list is built and once immediately before
+each delete. The confirmation prompt between them is an unbounded window, and
+this is an `rm -rf`.
+
 ### Why check hooks have three results
 
 A provider check returns 0 for healthy, 1 for a real problem, and 2 for no

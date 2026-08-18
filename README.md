@@ -368,7 +368,18 @@ A third hook is optional:
 _cs_provider_<tool>_paths <profile>   # directories this tool owns, one per line
 ```
 
-`cs rm` asks for those paths before it deletes anything, lists them in the confirmation prompt, and deletes them with the profile. Print paths; do not delete them yourself. `cs rm` holds the guards, and it refuses any path that is your home directory, a shared configuration directory, or the profiles root.
+`cs rm` asks for those paths before it deletes anything, lists them in the confirmation prompt, and deletes them with the profile. Print paths; do not delete them yourself. `cs rm` holds the guards.
+
+`cs rm` deletes a path only when every rule below holds. It names anything it refuses, so you can remove that by hand.
+
+- The path is absolute, and is not a symlink.
+- The path sits under your home directory, at least two levels down. `~/.ssh` and `~/Documents` are one level down, so `cs` never deletes them.
+- The path is not `~/.config`, `~/.config/gcloud`, `~/.claude`, the profiles root, or any ancestor of your home directory.
+- You own the path, and no one else can write it. This is the same test `cs` applies before it sources `profile.env`.
+
+`cs` re-runs those checks immediately before it deletes, because the confirmation prompt sits between the first check and the deletion.
+
+Print paths on standard output. `cs` sends everything your `profile.env` prints to standard error, so a banner line in that file cannot reach the deletion list.
 
 ## The `claude` wrapper (and how to avoid it)
 
@@ -402,7 +413,8 @@ export CS_QUIET=1
 - 🩺 `cs doctor` flags the real failure mode: one account in multiple namespaces (which causes surprise re-logins).
 - 🖥️ CLI-only: desktop app and IDE extensions do not inherit your shell's `CLAUDE_CONFIG_DIR`.
 - 🔐 `~/.claude/profiles/<name>` contains full Claude Code login state. Protect it like your normal Claude config.
-- 🗑️ `cs rm <name>` also deletes the profile's gcloud directory, because `cs login <name> gcloud` puts a live OAuth token there. It names every such directory in the confirmation prompt first, and refuses to delete a shared one.
+- 🗑️ `cs rm <name>` also deletes the profile's gcloud directory, because `cs login <name> gcloud` puts a live OAuth token there. It names every such directory in the confirmation prompt first, and refuses a symlink, a shared directory, and anything sitting directly in your home directory.
+- 🔒 `cs login <name> gcloud` checks the directory before it writes anything. It refuses a symlink, refuses a directory you do not own, and creates the directory and its parents with mode 0700. gcloud stores its refresh token in a file there, so the directory is the secret.
 - 📁 Profiles stay under `~/.claude/profiles` even though `cs` now pins more than Claude Code. Claude Code names each keychain entry after the hash of that path. Moving the directory would orphan every stored credential.
 - 🧰 `profile.env` pins other tools. `cs` sources it, so it runs code. Keep it to plain `export` lines, and keep it `chmod 600`.
 - 🧹 Upgrading from a pre-keychain version? Those releases stored plaintext credentials in `~/.claude/accounts/<name>.*` — including a dump with your claude.ai tokens **and** every MCP server's tokens and client secrets. `cs rm <name>` now deletes them; check that directory for profiles you no longer use.

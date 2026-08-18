@@ -665,10 +665,17 @@ _cs_with_profile_env() {
   }
   (
     _cs_clear_profile_env
+    # Send everything the LOAD prints to stderr, so the hook owns stdout alone.
+    # profile.env is sourced here, and any line it prints — a banner, a
+    # `mkdir -pv`, a sourced helper — would otherwise be indistinguishable from
+    # the hook's output. `cs rm` reads that output as a list of directories to
+    # delete, so a single `echo "$HOME/Documents"` in a profile.env put a real
+    # directory on the delete list and described it to the user as a credential.
+    #
     # Read the applied flag, not the status. A profile.env whose last line
     # returns non-zero has still exported everything above it, and refusing to
     # run the provider there sent the user to a file that was working.
-    _cs_load_profile_env "$name"
+    { _cs_load_profile_env "$name"; } >&2
     ((_cs_env_applied)) || exit 2
     printf 'loaded' >"$marker"
     "$@"
@@ -872,10 +879,36 @@ _cs_gcloud_login_here() {
       echo "    (your shell exports CLOUDSDK_CONFIG=$CLOUDSDK_CONFIG; cs will not use it)" >&2
     return 1
   }
-  mkdir -p "$CLOUDSDK_CONFIG" || return 1
   # gcloud keeps its credentials in a file inside this directory, on every
-  # platform — there is no keychain here. The directory IS the secret.
-  chmod 700 "$CLOUDSDK_CONFIG" 2>/dev/null
+  # platform — there is no keychain here. The directory IS the secret. So it
+  # gets the same test cs applies before it sources profile.env, and it gets it
+  # before any credential is written, not after.
+  if [[ -L "$CLOUDSDK_CONFIG" ]]; then
+    echo "cs: refusing to log in — $CLOUDSDK_CONFIG is a symlink." >&2
+    echo "    gcloud would write your refresh token wherever it points." >&2
+    return 1
+  fi
+  # 077 so the intermediate directories mkdir creates are private too. Only the
+  # leaf was chmodded before, which left ~/.config/gcloud-profiles group- or
+  # world-writable under a permissive umask — enough for someone else to swap
+  # the leaf for a symlink.
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+  mkdir -p "$CLOUDSDK_CONFIG"
+  local mk_rc=$?
+  umask "$old_umask"
+  ((mk_rc == 0)) || return 1
+  if ! chmod 700 "$CLOUDSDK_CONFIG" 2>/dev/null; then
+    echo "cs: refusing to log in — could not set 0700 on $CLOUDSDK_CONFIG." >&2
+    return 1
+  fi
+  local why
+  if why="$(_cs_env_path_unsafe "$CLOUDSDK_CONFIG")"; then
+    echo "cs: refusing to log in — $CLOUDSDK_CONFIG is unsafe: $why." >&2
+    echo "    gcloud writes a long-lived refresh token there." >&2
+    return 1
+  fi
 
   echo "cs: logging gcloud into profile '$name' ($CLOUDSDK_CONFIG)" >&2
   gcloud auth login "$@" || return $?
@@ -1225,9 +1258,18 @@ EOF
 # gcloud's own ~/.config/gcloud is refused by name: deleting it would take every
 # login made in an unpinned shell, which is not this profile's to remove.
 _cs_rm_path_unsafe() {
-  local raw="$1" why="" p home root
+  local raw="$1" why="" p home root rel
   if [[ -z "$raw" || "$raw" != /* ]]; then
     echo "cs: refusing to delete $raw — it is not an absolute path." >&2
+    return 0
+  fi
+  # A provider directory must never BE a symlink at delete time. The guard
+  # compares resolved paths, so without this a symlink planted in place of the
+  # directory would be resolved to its target and the target deleted instead.
+  # Only the final component matters: an ancestor symlink is ordinary (/var on
+  # macOS resolves to /private/var).
+  if [[ -L "$raw" ]]; then
+    echo "cs: refusing to delete $raw — it is a symlink." >&2
     return 0
   fi
   # Normalize BOTH sides before comparing. A raw string test is defeated by a
@@ -1249,8 +1291,26 @@ _cs_rm_path_unsafe() {
     why="is a shared configuration directory"
   elif [[ "$p" == "$home/.claude" || "$p" == "$root" || "$root" == "$p"/* ]]; then
     why="is the profile store"
+  elif [[ "$p" != "$home"/* ]]; then
+    # Containment. cs deletes only inside your home directory; anything else is
+    # named by hand rather than removed on a guess.
+    why="is outside your home directory"
   else
-    return 1
+    rel="${p#"$home"/}"
+    if [[ "$rel" != */* ]]; then
+      # A denylist can only refuse the paths someone thought of. A per-profile
+      # directory sits at least two levels below home (~/.config/gcloud-profiles
+      # /work); a single level is ~/.ssh, ~/.aws, ~/Documents — a typo in
+      # CLOUDSDK_CONFIG, not a provider directory.
+      why="sits directly in your home directory, so cs will not assume it is a provider directory"
+    elif why="$(_cs_env_path_unsafe "$p")"; then
+      # Same ownership and mode test cs applies before sourcing profile.env.
+      # A directory you do not own, or that others can write, is not one cs
+      # should delete on your behalf.
+      : # why is already set by the call above
+    else
+      return 1
+    fi
   fi
   echo "cs: refusing to delete $raw — it $why." >&2
   return 0
@@ -1378,6 +1438,9 @@ _cs_rm() {
     # credentials, so a silent failure is the worst outcome.
     local pleft=()
     for ppath in "${provider_paths[@]}"; do
+      # Re-check here, not only when the list was built. The confirmation prompt
+      # between the two is an unbounded window, and this is an `rm -rf`.
+      _cs_rm_path_unsafe "$ppath" && continue
       rm -rf "$ppath"
       [[ -e "$ppath" ]] && pleft+=("$ppath")
     done

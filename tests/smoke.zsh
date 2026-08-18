@@ -1410,6 +1410,83 @@ t_login_gcloud_does_not_pin_the_shell() {
   teardown
 }
 
+t_provider_output_is_not_mixed_with_profile_env_output() {
+  echo "[providers: profile.env output never reaches a hook's channel]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # A profile.env that prints something. A banner, a `mkdir -pv`, a sourced
+  # helper — all ordinary. cs rm reads a hook's stdout as directories to delete,
+  # so a printed path must never land there.
+  seed_profile_env work "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/work\"
+echo \"\$HOME/Documents\""
+  mkdir -p "$HOME/Documents"
+  printf 'my thesis' >"$HOME/Documents/thesis.txt"
+  cs login work gcloud >/dev/null 2>&1
+
+  # Capture stdout ONLY. The printed line still reaches the user, on stderr;
+  # what must not happen is cs treating it as a directory to delete.
+  local out
+  out="$(printf 'y\n' | cs rm work 2>/dev/null)"
+  assert_not_contains "the printed path is not offered for deletion" "$out" "Documents"
+  assert_file_exists "and it still exists" "$HOME/Documents/thesis.txt"
+  assert_dir_absent "the real provider directory is still deleted" \
+    "$HOME/.config/gcloud-profiles/work"
+
+  # doctor reads a check hook's stdout the same way, so a profile.env must not
+  # be able to write a line into the report.
+  seed_profile home home@corp.com
+  seed_profile_env home "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/home\"
+echo 'home — gcloud: attacker@evil.example (spoofed)'"
+  printf 'real@corp.com\n' >"$HOME/.gcloud-accounts"
+  out="$(cs doctor 2>/dev/null)"
+  assert_not_contains "a profile.env cannot forge a doctor line" "$out" "spoofed"
+  teardown
+}
+
+t_gcloud_refuses_an_unsafe_credential_directory() {
+  echo "[gcloud: the credential directory is checked before any login]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+
+  # A symlink standing in for the directory would send the refresh token
+  # wherever it points.
+  mkdir -p "$HOME/attacker"
+  mkdir -p "$HOME/.config/gcloud-profiles"
+  ln -s "$HOME/attacker" "$HOME/.config/gcloud-profiles/work"
+  seed_gcloud_env work
+  local out
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "refuses a symlinked directory" "$out" "is a symlink"
+  assert_eq "gcloud was never run" "$(cat "$HOME/.gcloud-argv")" ""
+  assert_file_absent "no credential reached the attacker's directory" \
+    "$HOME/attacker/application_default_credentials.json"
+
+  # A world-writable directory that you own is repaired, not refused: cs sets
+  # 0700 before the login runs, so the refresh token never lands in a directory
+  # someone else can read.
+  rm -f "$HOME/.config/gcloud-profiles/work"
+  mkdir -p "$HOME/.config/gcloud-profiles/work"
+  chmod 777 "$HOME/.config/gcloud-profiles/work"
+  cs login work gcloud >/dev/null 2>&1
+  local mode
+  mode="$(_cs_env_path_unsafe "$HOME/.config/gcloud-profiles/work" || echo safe)"
+  assert_eq "a world-writable directory is tightened first" "$mode" "safe"
+
+  # The normal case still works, and the directory it creates is private.
+  rm -rf "$HOME/.config/gcloud-profiles"
+  cs login work gcloud >/dev/null 2>&1
+  assert_file_exists "the login wrote the credential" \
+    "$HOME/.config/gcloud-profiles/work/application_default_credentials.json"
+  local mode
+  mode="$(_cs_env_path_unsafe "$HOME/.config/gcloud-profiles/work" || echo safe)"
+  assert_eq "the directory is private" "$mode" "safe"
+  mode="$(_cs_env_path_unsafe "$HOME/.config/gcloud-profiles" || echo safe)"
+  assert_eq "so is the directory above it" "$mode" "safe"
+  teardown
+}
+
 t_rm_guard_normalizes_paths() {
   echo "[rm: the delete guard normalizes before comparing]"
   setup
@@ -1418,18 +1495,42 @@ t_rm_guard_normalizes_paths() {
   local p
   for p in "$HOME/.config/gcloud" "$HOME/.config/gcloud/" "$HOME/.config/gcloud/." \
     "$HOME/./.config/gcloud" "$HOME/.config" "$HOME/.config/" "$HOME" "$HOME/" \
-    "$HOME/.claude" "$HOME/.claude/profiles" "/" "relative/path"; do
+    "$HOME/.claude" "$HOME/.claude/profiles" "/" "relative/path" \
+    "$HOME/.ssh" "$HOME/.aws" "$HOME/.gnupg" "$HOME/Documents" "/etc"; do
     if _cs_rm_path_unsafe "$p" >/dev/null 2>&1; then
       _pass "refuses $p"
     else
       _fail "refuses $p" "the guard allowed it"
     fi
   done
-  # A real per-profile directory must still be deletable.
+  # A real per-profile directory must still be deletable. It has to exist and be
+  # private, because the guard now applies the same ownership and mode test cs
+  # uses before it sources profile.env.
+  mkdir -p "$HOME/.config/gcloud-profiles/work"
+  chmod 700 "$HOME/.config/gcloud-profiles/work"
   if _cs_rm_path_unsafe "$HOME/.config/gcloud-profiles/work" >/dev/null 2>&1; then
     _fail "allows a per-profile directory" "the guard refused it"
   else
     _pass "allows a per-profile directory"
+  fi
+
+  # A world-writable one is not cs's to delete.
+  mkdir -p "$HOME/.config/gcloud-profiles/loose"
+  chmod 777 "$HOME/.config/gcloud-profiles/loose"
+  if _cs_rm_path_unsafe "$HOME/.config/gcloud-profiles/loose" >/dev/null 2>&1; then
+    _pass "refuses a world-writable directory"
+  else
+    _fail "refuses a world-writable directory" "the guard allowed it"
+  fi
+
+  # Nor is a symlink standing in for one: the guard compares resolved paths, so
+  # deleting through the link would destroy whatever it points at.
+  mkdir -p "$HOME/victim"
+  ln -s "$HOME/victim" "$HOME/.config/gcloud-profiles/linked"
+  if _cs_rm_path_unsafe "$HOME/.config/gcloud-profiles/linked" >/dev/null 2>&1; then
+    _pass "refuses a symlinked provider directory"
+  else
+    _fail "refuses a symlinked provider directory" "the guard allowed it"
   fi
   teardown
 }
@@ -1811,6 +1912,8 @@ t_doctor_gcloud_checks
 t_gcloud_ignores_inherited_config
 t_env_parser_ignores_comments
 t_rm_guard_normalizes_paths
+t_provider_output_is_not_mixed_with_profile_env_output
+t_gcloud_refuses_an_unsafe_credential_directory
 t_rm_warns_when_it_cannot_read_provider_paths
 t_env_trailing_conditional_still_applies
 t_env_tracking_survives_a_custom_ifs
