@@ -1438,6 +1438,35 @@ t_snapshot_shell_reports_a_missing_self() {
   teardown
 }
 
+t_version() {
+  echo "[version: cs reports its own version]"
+  setup
+  local out
+  out="$(cs version 2>&1)"
+  assert_contains "names the tool" "$out" "context-switch"
+  # A three-part version, so a report says which release the user is on.
+  if [[ "$out" =~ 'context-switch [0-9]+\.[0-9]+\.[0-9]+$' ]]; then
+    _pass "prints a three-part version"
+  else
+    _fail "prints a three-part version" "actual: $out"
+  fi
+  assert_eq "--version matches" "$(cs --version 2>&1)" "$out"
+  assert_eq "-v matches" "$(cs -v 2>&1)" "$out"
+  assert_eq "version exits 0" "$(
+    cs version >/dev/null 2>&1
+    echo $?
+  )" "0"
+
+  # The constant and the help text must agree with each other.
+  assert_contains "help lists the subcommand" "$(cs help 2>&1)" "cs version"
+
+  # An unknown subcommand must still be refused, so `version` did not widen the
+  # dispatcher by accident.
+  out="$(cs nope 2>&1)"
+  assert_contains "unknown subcommand still refused" "$out" "unknown subcommand"
+  teardown
+}
+
 t_use_warn_list_stays_in_sync() {
   echo "[use: the warn list matches _CS_AUTH_OVERRIDE_VARS]"
   setup
@@ -2111,6 +2140,7 @@ t_snapshot_shell_provider_commands_self_heal
 t_snapshot_shell_reports_a_missing_self
 t_restore_helper_survives_the_snapshot_filter
 t_use_warn_list_stays_in_sync
+t_version
 t_login_provider_grammar
 t_login_gcloud_provider
 t_login_gcloud_does_not_pin_the_shell

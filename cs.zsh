@@ -74,6 +74,11 @@
 # level: inside a function $0 names the function instead, and the self-heal
 # loses the only path it can use. A wrong value fails safe — `cs` cannot read
 # the file and says so.
+# Released version. `cs version` prints it, and the bug report template asks
+# for it, because most of what this tool touches is Claude Code internals that
+# move between releases.
+typeset -g _CS_VERSION="1.0.0"
+
 typeset -g _CS_SELF="${0:A}"
 
 # Restore the _cs_* helpers if this shell lost them, and report whether they are
@@ -1641,6 +1646,7 @@ Usage:
                     logged into more than one namespace (the thing that causes
                     surprise re-logins). Also runs every provider's check.
   cs current        Print the pin for this shell.
+  cs version        Print the version of context-switch.
   cs rm <name>      Delete a profile's config, its keychain login, any legacy
                     plaintext credential files left by an older cs, and the
                     directories its providers own (such as the profile's gcloud
@@ -1770,6 +1776,7 @@ cs() {
   current) _cs_current "$@" ;;
   env) _cs_env "$@" ;;
   rm) _cs_rm "$@" ;;
+  version | --version | -v) echo "context-switch $_CS_VERSION" ;;
   help | -h | --help | "") _cs_help ;;
   *)
     echo "cs: unknown subcommand '$subcmd' (try: cs help)" >&2
