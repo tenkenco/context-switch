@@ -167,7 +167,7 @@ Do this once per account. The `CLOUDSDK_CONFIG` export must already be active, s
 ```sh
 cs use work
 mkdir -p "$CLOUDSDK_CONFIG"
-gcloud auth login                       # writes only into this profile's dir
+gcloud auth login                       # writes only into this profile's directory
 gcloud auth application-default login   # what Terraform reads
 gcloud config set project my-project
 gcloud auth application-default set-quota-project my-project
@@ -178,6 +178,68 @@ Set the quota project. Some APIs reject application default credentials without 
 A fresh `CLOUDSDK_CONFIG` directory starts empty. Your existing gcloud logins do not carry over, so you log in once per profile.
 
 Set `GOOGLE_APPLICATION_CREDENTIALS` as well as `CLOUDSDK_CONFIG`. The gcloud CLI reads the first variable. Go programs such as the Terraform google provider may not, and every Google auth library reads the second one.
+
+#### Run both login commands
+
+The two login commands save two different credentials.
+
+`gcloud auth login` saves the credential that the `gcloud` command itself uses. `gcloud auth application-default login` saves the application default credential, in the file `application_default_credentials.json`. Terraform, client libraries, and most SDKs read the second credential.
+
+Skipping the second command leaves `GOOGLE_APPLICATION_CREDENTIALS` pointing at a file that does not exist. Google auth libraries then fail. They do not fall back to another credential:
+
+```text
+google.auth.exceptions.DefaultCredentialsError: File
+/Users/you/.config/gcloud-profiles/work/application_default_credentials.json
+was not found.
+```
+
+Run this check after you log in. It must print a real file:
+
+```sh
+cs use work
+ls -l "$GOOGLE_APPLICATION_CREDENTIALS"
+```
+
+#### Check which accounts a profile holds
+
+```sh
+cs use work
+gcloud auth list     # every account saved in this profile
+gcloud config list   # the active account and project
+```
+
+`gcloud auth list` reads `$CLOUDSDK_CONFIG` only, so each profile keeps its own list. A healthy profile lists exactly one account.
+
+#### Remove an account from the wrong profile
+
+`gcloud auth revoke` deletes one saved credential from the active `CLOUDSDK_CONFIG` directory. Pin the profile first, so you delete from the right directory.
+
+```sh
+cs use work
+gcloud auth list                        # confirm the account is here
+gcloud auth revoke you@personal.example # delete it from this profile
+gcloud auth list                        # confirm one account remains
+```
+
+`gcloud auth application-default revoke` deletes the application default credential of the pinned profile. Use it when the wrong account wrote that file.
+
+Revoking deletes the login. Run `gcloud auth login` again in the profile that should hold that account.
+
+#### Do not run gcloud unpinned
+
+`cs use` is what points gcloud at the per-profile directory. A shell with no pin uses the shared directory `~/.config/gcloud` instead. Every account you log in there stays in one list. One `gcloud auth login` there changes the active account for every unpinned shell. This rule matches the Claude rule above. Pin the shell first, then run the tool.
+
+Read the shared directory the same way:
+
+```sh
+CLOUDSDK_CONFIG="$HOME/.config/gcloud" gcloud auth list
+```
+
+Delete from it the accounts that you now keep in profiles:
+
+```sh
+CLOUDSDK_CONFIG="$HOME/.config/gcloud" gcloud auth revoke you@work.example
+```
 
 ### What cs can and cannot undo
 

@@ -1095,6 +1095,22 @@ Pinning other tools (profile.env):
   provider may not read CLOUDSDK_CONFIG, but every Google auth library reads
   GOOGLE_APPLICATION_CREDENTIALS.
 
+  Log gcloud in once per profile, and run BOTH commands:
+
+    cs use work
+    mkdir -p "$CLOUDSDK_CONFIG"
+    gcloud auth login                      # the gcloud command's own credential
+    gcloud auth application-default login  # what Terraform and the SDKs read
+
+  Without the second command, GOOGLE_APPLICATION_CREDENTIALS names a file that
+  does not exist, and Google auth libraries fail instead of falling back.
+
+  To see which accounts a profile holds, pin it and run `gcloud auth list`. That
+  command reads $CLOUDSDK_CONFIG only. Delete a wrong account with
+  `gcloud auth revoke <account>` while that profile is pinned. A shell with no
+  pin uses the shared ~/.config/gcloud directory instead, where every account
+  you log in stays in one list.
+
 The golden rule:
   One account -> one profile, and always `cs use` before `claude`. Claude Code
   now isolates credentials per CLAUDE_CONFIG_DIR (a keychain entry keyed by the

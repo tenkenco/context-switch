@@ -132,6 +132,32 @@ provider is Go. Every Google auth library honors
 `GOOGLE_APPLICATION_CREDENTIALS` unconditionally. Setting both makes the
 uncertain fact irrelevant.
 
+### Why the application default credentials file must exist
+
+`GOOGLE_APPLICATION_CREDENTIALS` is an explicit path, not a hint. A Google auth
+library that reads it, and finds no file there, raises an error. It does not
+fall back to `~/.config/gcloud`, and it does not fall back to the credential
+that `gcloud auth login` saved.
+
+That makes the two gcloud login commands both required per profile.
+`gcloud auth login` saves the credential for the `gcloud` command.
+`gcloud auth application-default login` writes
+`$CLOUDSDK_CONFIG/application_default_credentials.json`, which is the path the
+variable names. A profile with only the first login looks healthy under
+`gcloud auth list`, and still breaks Terraform.
+
+### Why the shared gcloud directory still matters
+
+`CLOUDSDK_CONFIG` removes the shared state for pinned shells only. A shell with
+no pin keeps reading `~/.config/gcloud`, which holds one account list and one
+active account for every unpinned shell. Accounts logged in there before the
+profiles existed stay there.
+
+This is the same failure as the Claude one: an identity that lives in two
+places. The fix is the same rule, applied to a second tool. Pin the shell, then
+run the tool. `cs` cannot enforce it, because `gcloud` is not a command that
+`cs` wraps.
+
 ### Why a data file and not per-tool code
 
 A `profile.env` file makes adding a tool a data change, not a code change. The
