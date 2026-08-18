@@ -158,7 +158,7 @@ SH
     _cs_load_profile_env _cs_env _cs_env_find_blocked _cs_env_path_unsafe \
     _cs_source_diagnostics _cs_login _cs_login_cleanup _cs_use _cs_run _cs_off \
     _cs_list _cs_current _cs_rm _cs_doctor _cs_help \
-    _cs_validate_provider _cs_provider_list _cs_with_profile_env \
+    _cs_validate_provider _cs_provider_list _cs_with_profile_env _cs_profile_pins \
     _cs_provider_claude_login _cs_provider_gcloud_login _cs_provider_gcloud_check \
     _cs_gcloud_login_here _cs_gcloud_check_here _cs_gcloud_project 2>/dev/null
   _CS_KC_SCHEME_CACHE=""
@@ -1397,6 +1397,109 @@ t_login_gcloud_does_not_pin_the_shell() {
   teardown
 }
 
+t_gcloud_ignores_inherited_config() {
+  echo "[gcloud: a CLOUDSDK_CONFIG from the user's shell is never used]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # A profile.env that pins other things, but nothing for gcloud.
+  seed_profile_env work 'export CS_TEST_ONE=one'
+  # ...and a shell that exports gcloud's shared directory, as a .zshrc would.
+  export CLOUDSDK_CONFIG="$HOME/.config/gcloud"
+  printf 'a@example.com\nb@example.com\n' >"$HOME/.gcloud-accounts"
+
+  local out
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "login refuses" "$out" "does not export CLOUDSDK_CONFIG"
+  assert_contains "login names the inherited value" "$out" "cs will not use it"
+  assert_eq "gcloud was never run" "$(cat "$HOME/.gcloud-argv")" ""
+  assert_file_absent "no credential in the shared directory" \
+    "$HOME/.config/gcloud/application_default_credentials.json"
+
+  # doctor must not report the shell's accounts under this profile's name.
+  out="$(cs doctor 2>&1)"
+  assert_not_contains "doctor stays silent" "$out" "gcloud"
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor exits 0" "$?" "0"
+  unset CLOUDSDK_CONFIG
+  teardown
+}
+
+t_gcloud_ignores_inherited_adc_path() {
+  echo "[gcloud: an inherited GOOGLE_APPLICATION_CREDENTIALS is not judged]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # This profile pins the directory but NOT the ADC path.
+  seed_profile_env work "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/work\""
+  printf 'work@corp.com\n' >"$HOME/.gcloud-accounts"
+  # The shell names an ADC file that does not exist.
+  export GOOGLE_APPLICATION_CREDENTIALS="$HOME/nowhere/adc.json"
+
+  local out
+  out="$(cs doctor 2>&1)"
+  assert_contains "reports the account" "$out" "gcloud: work@corp.com"
+  assert_not_contains "no false ADC failure" "$out" "NO application default"
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor exits 0" "$?" "0"
+  unset GOOGLE_APPLICATION_CREDENTIALS
+  teardown
+}
+
+t_gcloud_adc_outside_the_config_dir() {
+  echo "[gcloud: an ADC path outside CLOUDSDK_CONFIG gets different advice]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_profile_env work "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/work\"
+export GOOGLE_APPLICATION_CREDENTIALS=\"\$HOME/keys/work-sa.json\""
+  printf 'work@corp.com\n' >"$HOME/.gcloud-accounts"
+  local out
+  out="$(cs doctor 2>&1)"
+  assert_contains "still reports the missing file" "$out" "NO application default credentials"
+  assert_contains "explains no login writes it" "$out" "no login writes it"
+  assert_not_contains "does not suggest a login that cannot help" "$out" "Fix: cs login work gcloud"
+  teardown
+}
+
+t_gcloud_unusable_env_file() {
+  echo "[gcloud: an unusable profile.env is not a gcloud failure]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # A refused file: cs never manages PATH.
+  seed_profile_env work 'export PATH=/nowhere'
+
+  local out
+  out="$(cs doctor 2>&1)"
+  assert_contains "doctor explains the refusal" "$out" "refusing to load"
+  assert_not_contains "doctor blames no gcloud account" "$out" "NO ACCOUNT"
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor does not fail on it" "$?" "0"
+
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "login says no login ran" "$out" "no gcloud login ran"
+  assert_eq "gcloud was never run" "$(cat "$HOME/.gcloud-argv")" ""
+  cs login work gcloud >/dev/null 2>&1
+  assert_not_eq "login exits non-zero" "$?" "0"
+  teardown
+}
+
+t_gcloud_args_reach_both_logins() {
+  echo "[gcloud: extra arguments reach both logins]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  cs login work gcloud --no-launch-browser >/dev/null 2>&1
+  local argv
+  argv="$(cat "$HOME/.gcloud-argv")"
+  assert_contains "first login got the flag" "$argv" "auth login --no-launch-browser"
+  assert_contains "second login got the flag" "$argv" \
+    "auth application-default login --no-launch-browser"
+  teardown
+}
+
 t_doctor_gcloud_checks() {
   echo "[doctor: gcloud provider checks]"
   setup
@@ -1504,6 +1607,11 @@ t_login_provider_grammar
 t_login_gcloud_provider
 t_login_gcloud_does_not_pin_the_shell
 t_doctor_gcloud_checks
+t_gcloud_ignores_inherited_config
+t_gcloud_ignores_inherited_adc_path
+t_gcloud_adc_outside_the_config_dir
+t_gcloud_unusable_env_file
+t_gcloud_args_reach_both_logins
 
 #------------------------------------------------------------------- summary
 

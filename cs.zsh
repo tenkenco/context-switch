@@ -577,14 +577,41 @@ _cs_provider_list() { printf '%s' "${_CS_PROVIDERS[*]}"; }
 # `cs run` promise, reused. Clearing the CALLER's profile env first matters for
 # the same reason it does there: running a gcloud login from a shell pinned to
 # `work` must not hand the child work's CLOUDSDK_CONFIG.
+#
+# Exits 2 when the profile.env could not be loaded. A provider hook must not
+# turn a broken or refused env file into "your gcloud login is wrong": those are
+# different problems with different fixes, and _cs_load_profile_env has already
+# said which one it hit.
 _cs_with_profile_env() {
   local name="$1"
   shift
   (
     _cs_clear_profile_env
-    _cs_load_profile_env "$name" || exit 1
+    _cs_load_profile_env "$name" || exit 2
     "$@"
   )
+}
+
+# Did THIS profile's profile.env export $1?
+#
+# Being set is not the same as being pinned, and the difference is the whole
+# feature. A CLOUDSDK_CONFIG exported from the user's .zshrc is inherited by the
+# subshell above, because cs only clears the names a profile.env tracked. A
+# provider that trusted a set variable would then write the credential to
+# whatever global directory that .zshrc named — the exact leak per-profile
+# directories exist to stop — and report success.
+#
+# _cs_load_profile_env records the file's own names in _CS_PROFILE_ENV_VARS, and
+# _cs_clear_profile_env unsets that list first, so inside the subshell it holds
+# this profile's names and nothing else. Call this from inside the subshell.
+_cs_profile_pins() {
+  [[ -n "${_CS_PROFILE_ENV_VARS:-}" ]] || return 1
+  local IFS=$' \t\n' v
+  # shellcheck disable=SC2046
+  for v in $(printf '%s' "$_CS_PROFILE_ENV_VARS"); do
+    [[ "$v" == "$1" ]] && return 0
+  done
+  return 1
 }
 
 #------------------------------------------------------------------ provider: claude
@@ -665,7 +692,10 @@ _cs_gcloud_project() {
 _cs_gcloud_check_here() {
   local name="$1"
   # A profile that does not pin gcloud is not a gcloud problem. Say nothing.
-  [[ -n "${CLOUDSDK_CONFIG:-}" ]] || return 2
+  # `pins`, not `is set`: an inherited CLOUDSDK_CONFIG belongs to the user's
+  # shell, and reporting its accounts under this profile's name would be a false
+  # alarm whose suggested fix revoked from the wrong directory.
+  _cs_profile_pins CLOUDSDK_CONFIG || return 2
 
   local bad=0 accounts count
   accounts="$(gcloud auth list --format='value(account)' 2>/dev/null)"
@@ -690,10 +720,22 @@ _cs_gcloud_check_here() {
   # breaks Terraform and every client library, because a
   # GOOGLE_APPLICATION_CREDENTIALS that names a missing file is an error to
   # those libraries — they do not fall back to any other credential.
-  if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && ! -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
+  if _cs_profile_pins GOOGLE_APPLICATION_CREDENTIALS &&
+    [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && ! -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
     echo "  $name — gcloud: NO application default credentials"
     echo "      $GOOGLE_APPLICATION_CREDENTIALS does not exist, so Terraform and" >&2
-    echo "      the client libraries fail. Fix: cs login $name gcloud" >&2
+    echo "      the client libraries fail." >&2
+    # `gcloud auth application-default login` always writes the well-known path
+    # inside CLOUDSDK_CONFIG. A profile that points the variable somewhere else
+    # — a service account key, say — needs that file put there, and telling the
+    # user to run a login that cannot create it would loop forever.
+    if [[ "$GOOGLE_APPLICATION_CREDENTIALS" == "$CLOUDSDK_CONFIG/application_default_credentials.json" ]]; then
+      echo "      Fix: cs login $name gcloud" >&2
+    else
+      echo "      This profile points that variable outside CLOUDSDK_CONFIG, so" >&2
+      echo "      no login writes it. Put the file there, or point the variable" >&2
+      echo "      at $CLOUDSDK_CONFIG/application_default_credentials.json" >&2
+    fi
     bad=1
   fi
 
@@ -711,10 +753,15 @@ _cs_provider_gcloud_check() {
 _cs_gcloud_login_here() {
   local name="$1"
   shift
-  [[ -n "${CLOUDSDK_CONFIG:-}" ]] || {
+  # `pins`, not `is set`. A CLOUDSDK_CONFIG inherited from the caller's .zshrc
+  # would otherwise send this login to that global directory while cs announced
+  # the profile's name and reported success.
+  _cs_profile_pins CLOUDSDK_CONFIG || {
     echo "cs: profile '$name' does not export CLOUDSDK_CONFIG, so cs cannot tell" >&2
     echo "    gcloud where to write. Add it to the profile.env shown by:" >&2
     echo "      cs env $name" >&2
+    [[ -n "${CLOUDSDK_CONFIG:-}" ]] &&
+      echo "    (your shell exports CLOUDSDK_CONFIG=$CLOUDSDK_CONFIG; cs will not use it)" >&2
     return 1
   }
   mkdir -p "$CLOUDSDK_CONFIG" || return 1
@@ -728,8 +775,12 @@ _cs_gcloud_login_here() {
   # The SECOND credential, and the one people skip. `gcloud auth login` serves
   # the gcloud command itself. This writes application_default_credentials.json,
   # which Terraform, the client libraries, and most SDKs read.
+  #
+  # Extra arguments go to BOTH logins. The reason is --no-launch-browser: on a
+  # headless host, passing it to the first login only would run the second one
+  # straight into a browser that does not exist. Use flags both commands accept.
   echo "cs: now the application default credentials (what Terraform reads)" >&2
-  gcloud auth application-default login || return $?
+  gcloud auth application-default login "$@" || return $?
 
   local project
   project="$(_cs_gcloud_project)"
@@ -762,6 +813,16 @@ _cs_provider_gcloud_login() {
     return 1
   }
   _cs_with_profile_env "$name" _cs_gcloud_login_here "$name" "$@"
+  local rc=$?
+  # 2 means the profile.env itself could not be loaded, so no login ran.
+  # _cs_load_profile_env has already printed which rule the file broke; say what
+  # that means for this command, and do not report it as a gcloud failure.
+  ((rc == 2)) && {
+    echo "cs: no gcloud login ran, because profile '$name' has an unusable" >&2
+    echo "    profile.env. Fix the file, then run this again." >&2
+    return 1
+  }
+  return "$rc"
 }
 
 #------------------------------------------------------------------ login dispatcher
@@ -1347,7 +1408,13 @@ Providers:
 
   `cs login work gcloud` reads CLOUDSDK_CONFIG from the profile's profile.env,
   runs BOTH gcloud logins there, sets the quota project, and then verifies.
-  `cs doctor` runs the same verification for every profile that pins gcloud.
+  The command fails when the verification fails, so a profile left holding two
+  accounts stops a `cs login work gcloud && ...` chain. `cs doctor` runs the
+  same verification for every profile that pins gcloud.
+
+  cs uses the variable only when the PROFILE exports it. A CLOUDSDK_CONFIG
+  exported by your .zshrc is ignored, because writing this profile's credential
+  into that global directory is the leak this feature exists to prevent.
 
   Providers are plain functions, found by name. To add your own, define
   _cs_provider_<tool>_login (and optionally _cs_provider_<tool>_check) in your

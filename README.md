@@ -304,7 +304,23 @@ Those two operations do not commute. Run `gcloud auth login` before `cs use work
 
 The verification checks two things. The file behind `GOOGLE_APPLICATION_CREDENTIALS` must exist. `gcloud auth list` must show exactly one account.
 
+The command fails when the verification fails. A profile left holding two accounts therefore stops a `cs login work gcloud && ...` chain.
+
 The command refuses a profile with no `profile.env`, and a `profile.env` that does not export `CLOUDSDK_CONFIG`. In both cases `cs` cannot tell where gcloud should write, and guessing would put a credential in the wrong directory.
+
+Extra arguments go to both gcloud logins, so use flags that both commands accept. `cs login work gcloud --no-launch-browser` is the case this serves, on a host with no browser.
+
+### `cs` uses a variable only when the profile pins it
+
+Being set is not the same as being pinned, and the difference decides where your credential lands.
+
+Suppose your `.zshrc` exports `CLOUDSDK_CONFIG`. That value reaches every command, including the subshell `cs` runs a provider in. `cs` clears the names a `profile.env` tracked, and a variable from your `.zshrc` was never tracked.
+
+So `cs` reads `CLOUDSDK_CONFIG` from the profile's own `profile.env`, and ignores an inherited one. `cs login work gcloud` refuses and names the inherited value. `cs doctor` says nothing about gcloud for that profile.
+
+The alternative would write the profile's credential into the global directory your `.zshrc` names, and report success. That is the leak this whole feature exists to prevent.
+
+The same rule covers `GOOGLE_APPLICATION_CREDENTIALS`. A profile that pins the directory but not that variable gets no report about it.
 
 ### `cs doctor` runs the same checks
 
@@ -314,10 +330,12 @@ cs doctor
 
 `cs doctor` reports each profile's Claude account, then asks every provider about the same profile. A profile that does not pin gcloud produces no gcloud output. `cs doctor` never guesses about a tool you do not use.
 
+`cs doctor` prints every Claude account first, then every provider result:
+
 ```text
 * work — you@work.com (claude.ai)
-  work — gcloud: you@work.com (my-project)
   personal — you@example.com (claude.ai)
+  work — gcloud: you@work.com (my-project)
   personal — gcloud: NO application default credentials
 ```
 
@@ -338,7 +356,9 @@ _CS_PROVIDERS+=(aws)
 
 A check hook returns 0 when the tool is healthy, 1 on a real problem, and 2 for no opinion. Return 2 when the profile does not pin your tool. That is what keeps `cs doctor` quiet.
 
-Use `_cs_with_profile_env <profile> <command...>` inside a hook. It applies the profile's `profile.env` in a subshell, so the caller's terminal keeps its own pin.
+Use `_cs_with_profile_env <profile> <command...>` inside a hook. It applies the profile's `profile.env` in a subshell, so the caller's terminal keeps its own pin. It exits 2 when the file cannot be loaded, so a broken `profile.env` never reads as a problem with your tool.
+
+Inside a hook, call `_cs_profile_pins <VAR>` before you read `VAR`. It answers whether this profile exported the name, which is the test that keeps an inherited value out of your tool.
 
 ## The `claude` wrapper (and how to avoid it)
 

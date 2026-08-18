@@ -196,6 +196,26 @@ caller's shell is never pinned.
 The pin stays for daily work, where it earns its place. One `cs use work`
 points every tool in that terminal at the same identity.
 
+### Why a provider reads only what the profile pinned
+
+A provider hook runs in a subshell with the profile's `profile.env` applied.
+That is not enough on its own. `cs` clears the names a `profile.env` tracked,
+and a `CLOUDSDK_CONFIG` exported by the user's `.zshrc` was never tracked, so it
+survives into the subshell.
+
+A hook that trusted a set variable would then write the profile's credential
+into whatever global directory that `.zshrc` named, print the profile's name,
+and report success. `cs doctor` had the mirror-image bug: it reported the shared
+directory's accounts under a profile that pinned nothing, and told the user to
+revoke them from a directory `cs use` never points at.
+
+So a hook asks `_cs_profile_pins CLOUDSDK_CONFIG` instead of testing whether the
+variable is set. `_cs_load_profile_env` records the file's own names in
+`_CS_PROFILE_ENV_VARS`, and `_cs_clear_profile_env` unsets that list first, so
+inside the subshell it names this profile's exports and nothing else.
+
+The rule reads as one sentence: being set is not the same as being pinned.
+
 ### Why check hooks have three results
 
 A provider check returns 0 for healthy, 1 for a real problem, and 2 for no
