@@ -967,9 +967,21 @@ t_profile_env_tracks_multiple_exports_per_line() {
   cs use personal >|"$SANDBOX/.out" 2>&1
   local out
   out="$(<"$SANDBOX/.out")"
-  assert_contains "refuses the ambiguous line" "$out" "more than one"
-  assert_contains "says how to fix it" "$out" "one 'export VAR=value' on each line"
+  assert_contains "refuses the ambiguous line" "$out" "cannot read the variable name"
+  assert_contains "says how to fix it" "$out" "must set exactly one variable"
   assert_eq "nothing applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+
+  # A quoted line yielding ZERO readable names is just as uncertain. It exports
+  # a variable cs cannot see, so cs could never unset it on the next `cs use`.
+  teardown
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export "CS_TEST_ONE"=leaks'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "refuses an unreadable quoted name" "$out" "cannot read the variable name"
+  assert_eq "the invisible export never applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_not_contains "does not claim success" "$out" "profile.env applied"
   teardown
 }
 
@@ -985,7 +997,7 @@ t_profile_env_quoted_multi_cannot_smuggle_blocked_name() {
   cs use personal >|"$SANDBOX/.out" 2>&1
   local out
   out="$(<"$SANDBOX/.out")"
-  assert_contains "refuses the file" "$out" "more than one"
+  assert_contains "refuses the file" "$out" "cannot read the variable name"
   assert_eq "PATH untouched" "$PATH" "$saved_path"
   assert_eq "the shell can still run commands" "$(command -v env >/dev/null && echo yes || echo no)" "yes"
   assert_eq "nothing applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
@@ -1398,6 +1410,77 @@ t_login_gcloud_does_not_pin_the_shell() {
   teardown
 }
 
+t_rm_guard_normalizes_paths() {
+  echo "[rm: the delete guard normalizes before comparing]"
+  setup
+  # A raw string test is defeated by a trailing slash, a '.' component, or a
+  # symlink — all ordinary ways to write a directory in a profile.env.
+  local p
+  for p in "$HOME/.config/gcloud" "$HOME/.config/gcloud/" "$HOME/.config/gcloud/." \
+    "$HOME/./.config/gcloud" "$HOME/.config" "$HOME/.config/" "$HOME" "$HOME/" \
+    "$HOME/.claude" "$HOME/.claude/profiles" "/" "relative/path"; do
+    if _cs_rm_path_unsafe "$p" >/dev/null 2>&1; then
+      _pass "refuses $p"
+    else
+      _fail "refuses $p" "the guard allowed it"
+    fi
+  done
+  # A real per-profile directory must still be deletable.
+  if _cs_rm_path_unsafe "$HOME/.config/gcloud-profiles/work" >/dev/null 2>&1; then
+    _fail "allows a per-profile directory" "the guard refused it"
+  else
+    _pass "allows a per-profile directory"
+  fi
+  teardown
+}
+
+t_rm_warns_when_it_cannot_read_provider_paths() {
+  echo "[rm: never drops provider paths in silence]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  cs login work gcloud >/dev/null 2>&1
+  local gdir="$HOME/.config/gcloud-profiles/work"
+  assert_file_exists "the login wrote credentials" "$gdir/application_default_credentials.json"
+
+  # Now make profile.env unreadable. cs rm deletes the profile, which takes the
+  # only record of where that gcloud directory is — so it must say so.
+  chmod 666 "$HOME/.claude/profiles/work/profile.env"
+  local out
+  out="$(printf 'y\n' | cs rm work 2>&1)"
+  assert_contains "warns that it cannot read profile.env" "$out" "could not read profile.env"
+  assert_contains "says the directories are not deleted" "$out" "will NOT be"
+  assert_contains "gives the reason" "$out" "group- or world-writable"
+  assert_file_exists "the credentials are still findable" \
+    "$gdir/application_default_credentials.json"
+  teardown
+}
+
+t_env_trailing_conditional_still_applies() {
+  echo "[profile.env: a trailing conditional does not block a provider]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # The file's own comments call this pattern ordinary: `source` returns the
+  # status of the LAST command, and this one is false on most machines.
+  seed_profile_env work "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/work\"
+export GOOGLE_APPLICATION_CREDENTIALS=\"\$HOME/.config/gcloud-profiles/work/application_default_credentials.json\"
+[[ -d \"\$HOME/definitely-not-here\" ]] && export CS_TEST_ONE=1"
+  local out
+  out="$(cs login work gcloud 2>&1)"
+  assert_not_contains "does not call the file unusable" "$out" "unusable"
+  assert_contains "the login runs" "$out" "gcloud-profiles/work"
+  assert_file_exists "and writes the credential" \
+    "$HOME/.config/gcloud-profiles/work/application_default_credentials.json"
+
+  # cs rm must still find the directory through that same file.
+  out="$(printf 'y\n' | cs rm work 2>&1)"
+  assert_contains "rm still finds the directory" "$out" "gcloud-profiles/work"
+  assert_dir_absent "and deletes it" "$HOME/.config/gcloud-profiles/work"
+  teardown
+}
+
 t_env_parser_ignores_comments() {
   echo "[profile.env: an unquoted comment is not a variable name]"
   setup
@@ -1727,6 +1810,9 @@ t_login_gcloud_does_not_pin_the_shell
 t_doctor_gcloud_checks
 t_gcloud_ignores_inherited_config
 t_env_parser_ignores_comments
+t_rm_guard_normalizes_paths
+t_rm_warns_when_it_cannot_read_provider_paths
+t_env_trailing_conditional_still_applies
 t_env_tracking_survives_a_custom_ifs
 t_gcloud_usage_error_is_not_a_broken_env_file
 t_rm_removes_provider_credentials

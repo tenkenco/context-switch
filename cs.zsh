@@ -186,6 +186,14 @@ typeset -ga _CS_ENV_BLOCKED_VARS=(
 typeset -ga _cs_env_var_names
 typeset -g _cs_env_parse_ambiguous=0
 
+# 1 when _cs_load_profile_env got far enough that the file's exports are in
+# effect (including the case of no file at all). Separate from its exit status,
+# which also reports a non-zero status from the file's LAST command — an
+# ordinary trailing `[[ -d "$D" ]] && export X=1` returns non-zero with every
+# export already applied. Treating that as "could not load" made
+# `cs login work gcloud` refuse to run against a perfectly good CLOUDSDK_CONFIG.
+typeset -g _cs_env_applied=0
+
 # Record _cs_env_var_names into the exported tracking list.
 #
 # In a function, so the join runs under a known IFS. `${array[*]}` joins on the
@@ -256,7 +264,12 @@ _cs_parse_env_vars() {
       count = 0
       for (i = 1; i <= n; i++)
         if (parts[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) count++
-      if (quoted && count > 1) { print "!AMBIGUOUS"; next }
+      # A quoted line must yield exactly one name. More than one, and cs cannot
+      # tell a real name from text inside a value. ZERO is just as uncertain:
+      # `export "AWS_PROFILE"=work` exports a variable this parser cannot see,
+      # so cs would report success and then leak that variable into the next
+      # profile — the drift the tracking exists to stop.
+      if (quoted && count != 1) { print "!AMBIGUOUS"; next }
       for (i = 1; i <= n; i++) {
         if (parts[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
           eq = index(parts[i], "=")
@@ -344,9 +357,14 @@ _cs_env_path_unsafe() {
 # Source a profile's env file into the CURRENT shell and record what it set.
 _cs_load_profile_env() {
   _cs_env_var_names=()
+  _cs_env_applied=0
   local f
   f="$(_cs_profile_env_file "$1")"
-  [[ -f "$f" ]] || return 0
+  # No file is not a failure: there is nothing to apply, so the caller may run.
+  [[ -f "$f" ]] || {
+    _cs_env_applied=1
+    return 0
+  }
 
   # Sourcing is running code, so refuse anything an attacker could have written.
   local why
@@ -378,9 +396,10 @@ _cs_load_profile_env() {
   _cs_parse_env_vars "$f"
 
   if ((_cs_env_parse_ambiguous)); then
-    echo "cs: refusing to load $f — a quoted export line sets more than one" >&2
-    echo "    variable, and cs cannot tell a real name from text inside a quoted" >&2
-    echo "    value. Put one 'export VAR=value' on each line." >&2
+    echo "cs: refusing to load $f — cs cannot read the variable name on a quoted" >&2
+    echo "    export line. A quoted line must set exactly one variable, written as" >&2
+    echo "    export NAME=\"value\" — not export \"NAME\"=value, and not two names" >&2
+    echo "    on one line. cs cannot unset a name it cannot see." >&2
     _cs_env_var_names=()
     return 1
   fi
@@ -414,6 +433,8 @@ _cs_load_profile_env() {
   # shellcheck source=/dev/null
   source "$f"
   local src_rc=$?
+  # Past this point the exports are in effect, whatever the status says.
+  _cs_env_applied=1
 
   # Put back anything the file moved, and say so. Listed by name rather than by
   # indirection so shfmt and shellcheck can still parse this file.
@@ -644,7 +665,11 @@ _cs_with_profile_env() {
   }
   (
     _cs_clear_profile_env
-    _cs_load_profile_env "$name" || exit 2
+    # Read the applied flag, not the status. A profile.env whose last line
+    # returns non-zero has still exported everything above it, and refusing to
+    # run the provider there sent the user to a file that was working.
+    _cs_load_profile_env "$name"
+    ((_cs_env_applied)) || exit 2
     printf 'loaded' >"$marker"
     "$@"
   )
@@ -1200,24 +1225,34 @@ EOF
 # gcloud's own ~/.config/gcloud is refused by name: deleting it would take every
 # login made in an unpinned shell, which is not this profile's to remove.
 _cs_rm_path_unsafe() {
-  local p="$1" why=""
-  local home="${HOME%/}"
-  if [[ -z "$p" || "$p" != /* ]]; then
-    why="not an absolute path"
-  elif [[ "$p" == *..* ]]; then
-    why="contains '..'"
-  elif [[ "$p" == "/" || "$p" == "$home" || "$p" == "$home/" ]]; then
-    why="is / or your home directory"
+  local raw="$1" why="" p home root
+  if [[ -z "$raw" || "$raw" != /* ]]; then
+    echo "cs: refusing to delete $raw — it is not an absolute path." >&2
+    return 0
+  fi
+  # Normalize BOTH sides before comparing. A raw string test is defeated by a
+  # trailing slash, a '.' or '..' component, or a symlink, and every one of
+  # those is an ordinary way to write a directory in a profile.env. Writing
+  # CLOUDSDK_CONFIG="$HOME/.config/gcloud/" used to pass this guard and take
+  # every gcloud login made in an unpinned shell with it.
+  p="${raw:A}"
+  home="${HOME:A}"
+  root="$(_cs_profiles_root)"
+  root="${root:A}"
+  if [[ "$p" == "/" ]]; then
+    why="is the filesystem root"
+  elif [[ "$p" == "$home" ]]; then
+    why="is your home directory"
   elif [[ "$home" == "$p"/* ]]; then
     why="contains your home directory"
   elif [[ "$p" == "$home/.config" || "$p" == "$home/.config/gcloud" ]]; then
     why="is a shared configuration directory"
-  elif [[ "$p" == "$(_cs_profiles_root)" ]]; then
-    why="is the profiles root"
+  elif [[ "$p" == "$home/.claude" || "$p" == "$root" || "$root" == "$p"/* ]]; then
+    why="is the profile store"
   else
     return 1
   fi
-  echo "cs: refusing to delete $p — it $why." >&2
+  echo "cs: refusing to delete $raw — it $why." >&2
   return 0
 }
 
@@ -1249,14 +1284,31 @@ _cs_rm() {
   # OAuth refresh token in the gcloud directory and removed the only record of
   # where that directory was.
   local -a provider_paths=()
-  local prov ppath
+  local prov ppath pout prc
   for prov in "${_CS_PROVIDERS[@]}"; do
     typeset -f "_cs_provider_${prov}_paths" >/dev/null 2>&1 || continue
+    # stderr is deliberately NOT suppressed: when the profile.env cannot be
+    # read, the reason is the only thing that tells the user why their
+    # credentials are about to be orphaned.
+    pout="$("_cs_provider_${prov}_paths" "$name")"
+    prc=$?
+    if ((prc == 2)); then
+      # Silence here is the dangerous case. `rm -rf "$cfg_dir"` below takes
+      # profile.env with it, which is the only record of where the provider's
+      # directory was, so a live credential would be left with no pointer to it.
+      echo "cs: WARNING — cs could not read profile.env for '$name', so it cannot" >&2
+      echo "    tell which directories the $prov provider owns. They will NOT be" >&2
+      echo "    deleted, and deleting this profile removes the file that names" >&2
+      echo "    them. Fix profile.env first if you want them removed too." >&2
+      continue
+    fi
     while IFS= read -r ppath; do
       [[ -n "$ppath" ]] || continue
+      # Compare and delete the SAME normalized path the guard approved.
+      ppath="${ppath:A}"
       _cs_rm_path_unsafe "$ppath" && continue
       [[ -d "$ppath" ]] && provider_paths+=("$ppath")
-    done < <("_cs_provider_${prov}_paths" "$name" 2>/dev/null)
+    done <<<"$pout"
   done
 
   local what="config + keychain login"
