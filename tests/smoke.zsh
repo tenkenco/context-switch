@@ -1438,6 +1438,26 @@ t_snapshot_shell_reports_a_missing_self() {
   teardown
 }
 
+t_use_warn_list_stays_in_sync() {
+  echo "[use: the warn list matches _CS_AUTH_OVERRIDE_VARS]"
+  setup
+  # _cs_use names the overriding auth vars one per line rather than looping with
+  # ${(P)…} indirection, because that form is not parseable by the shfmt and
+  # shellcheck runs in CI. Two copies can drift, and a var missing here is one
+  # the user is never warned about. Pin them.
+  #
+  # CLAUDE_CODE_OAUTH_TOKEN is deliberately absent from the warn list: _cs_use
+  # UNSETS it a few lines earlier, with its own note, because it conflicts with
+  # the pin. Warning that it is "still set" would be false.
+  local canonical listed
+  canonical="$(print -l "${_CS_AUTH_OVERRIDE_VARS[@]}" |
+    grep -v '^CLAUDE_CODE_OAUTH_TOKEN$' | sort -u | tr '\n' ' ')"
+  listed="$(grep -oE 'present\+=\([A-Z][A-Z0-9_]+\)' "$CS_ZSH" |
+    grep -oE '[A-Z][A-Z0-9_]+' | sort -u | tr '\n' ' ')"
+  assert_eq "warn list == _CS_AUTH_OVERRIDE_VARS minus the token" "$listed" "$canonical"
+  teardown
+}
+
 t_restore_helper_survives_the_snapshot_filter() {
   echo "[snapshot shell: the recovery helper is itself kept]"
   setup
@@ -2090,6 +2110,7 @@ t_snapshot_shell_cs_self_heals
 t_snapshot_shell_provider_commands_self_heal
 t_snapshot_shell_reports_a_missing_self
 t_restore_helper_survives_the_snapshot_filter
+t_use_warn_list_stays_in_sync
 t_login_provider_grammar
 t_login_gcloud_provider
 t_login_gcloud_does_not_pin_the_shell
