@@ -538,17 +538,60 @@ _cs_login_cleanup() {
   rm -rf "$cfg_dir"
 }
 
-_cs_login() {
-  local name="${1:-}"
-  [[ -z "$name" ]] && {
-    echo "cs login <name> [claude auth login args...]" >&2
-    return 1
-  }
+#==============================================================================
+# Providers.
+#
+# A provider is one tool whose login `cs` can drive into a profile. Providers
+# are plain functions, found by name:
+#
+#   _cs_provider_<provider>_login <profile> [args...]   run that tool's login
+#   _cs_provider_<provider>_check <profile>             report that tool's health
+#
+# Keeping them in this file rather than a providers/ directory is deliberate.
+# cs.zsh is sourced directly — by an absolute path from .zshrc, and by plugin
+# managers from their own clone — so a sibling directory would add a path to
+# resolve and break whenever someone copies the single file. The naming
+# convention costs nothing and lets you add your own provider from .zshrc:
+# define _cs_provider_aws_login and `cs login work aws` starts working.
+#
+# A check hook returns 0 (healthy), 1 (a real problem), or 2 (no opinion). 2 is
+# the important one: `cs doctor` must stay quiet about a tool the profile does
+# not pin, and must never guess.
+#==============================================================================
+
+# Provider names are stricter than profile names: lowercase, no dots, because
+# the name is pasted into a function name and looked up.
+_cs_validate_provider() {
+  [[ "$1" =~ ^[a-z][a-z0-9_]*$ ]]
+}
+
+# The providers cs ships with. `cs login` accepts any provider whose login hook
+# is defined, so a hook you write in .zshrc works without touching this list;
+# append to the list as well and `cs doctor` will call its check hook too.
+typeset -ga _CS_PROVIDERS=(claude gcloud)
+
+_cs_provider_list() { printf '%s' "${_CS_PROVIDERS[*]}"; }
+
+# Run a command with a profile's profile.env applied, and nothing else changed.
+# Always in a subshell, so the caller's shell keeps its own pin — this is the
+# `cs run` promise, reused. Clearing the CALLER's profile env first matters for
+# the same reason it does there: running a gcloud login from a shell pinned to
+# `work` must not hand the child work's CLOUDSDK_CONFIG.
+_cs_with_profile_env() {
+  local name="$1"
   shift
-  _cs_validate_name "$name" || {
-    echo "cs: invalid profile name '$name'" >&2
-    return 1
-  }
+  (
+    _cs_clear_profile_env
+    _cs_load_profile_env "$name" || exit 1
+    "$@"
+  )
+}
+
+#------------------------------------------------------------------ provider: claude
+
+_cs_provider_claude_login() {
+  local name="$1"
+  shift
 
   local cfg_dir created=0
   cfg_dir="$(_cs_profile_config_dir "$name")"
@@ -601,6 +644,171 @@ _cs_login() {
     return 1
   fi
   echo "cs: saved isolated login for '$name' (email: $(_cs_profile_email "$name"))"
+}
+
+#------------------------------------------------------------------ provider: gcloud
+
+# The active project of the pinned gcloud configuration, or nothing. `gcloud
+# config get-value` reports an unset value as the literal text "(unset)" — on
+# stdout in older releases, on stderr in newer ones — so filter both rather than
+# passing that text on to set-quota-project.
+_cs_gcloud_project() {
+  local p
+  p="$(gcloud config get-value project 2>/dev/null)"
+  [[ "$p" == "(unset)" ]] && p=""
+  printf '%s' "$p"
+}
+
+# Health of one profile's gcloud login. Runs INSIDE the profile.env subshell,
+# so CLOUDSDK_CONFIG and GOOGLE_APPLICATION_CREDENTIALS are the profile's own.
+# Returns 0 healthy, 1 a real problem, 2 no opinion.
+_cs_gcloud_check_here() {
+  local name="$1"
+  # A profile that does not pin gcloud is not a gcloud problem. Say nothing.
+  [[ -n "${CLOUDSDK_CONFIG:-}" ]] || return 2
+
+  local bad=0 accounts count
+  accounts="$(gcloud auth list --format='value(account)' 2>/dev/null)"
+  count=0
+  [[ -n "$accounts" ]] && count="$(printf '%s\n' "$accounts" | grep -c .)"
+
+  if ((count == 0)); then
+    echo "  $name — gcloud: NO ACCOUNT in $CLOUDSDK_CONFIG"
+    echo "      fix: cs login $name gcloud" >&2
+    bad=1
+  elif ((count > 1)); then
+    echo "  $name — gcloud: $count ACCOUNTS in one profile"
+    printf '%s\n' "$accounts" | sed 's/^/        /'
+    echo "      A profile holds one account. Delete the wrong one:" >&2
+    echo "        cs use $name && gcloud auth revoke <account>" >&2
+    bad=1
+  else
+    echo "  $name — gcloud: $accounts ($(_cs_gcloud_project))"
+  fi
+
+  # The second credential. Its absence is invisible to `gcloud auth list` and
+  # breaks Terraform and every client library, because a
+  # GOOGLE_APPLICATION_CREDENTIALS that names a missing file is an error to
+  # those libraries — they do not fall back to any other credential.
+  if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && ! -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
+    echo "  $name — gcloud: NO application default credentials"
+    echo "      $GOOGLE_APPLICATION_CREDENTIALS does not exist, so Terraform and" >&2
+    echo "      the client libraries fail. Fix: cs login $name gcloud" >&2
+    bad=1
+  fi
+
+  return "$bad"
+}
+
+_cs_provider_gcloud_check() {
+  local name="$1"
+  command -v gcloud >/dev/null 2>&1 || return 2
+  [[ -f "$(_cs_profile_env_file "$name")" ]] || return 2
+  _cs_with_profile_env "$name" _cs_gcloud_check_here "$name"
+}
+
+# Runs INSIDE the profile.env subshell.
+_cs_gcloud_login_here() {
+  local name="$1"
+  shift
+  [[ -n "${CLOUDSDK_CONFIG:-}" ]] || {
+    echo "cs: profile '$name' does not export CLOUDSDK_CONFIG, so cs cannot tell" >&2
+    echo "    gcloud where to write. Add it to the profile.env shown by:" >&2
+    echo "      cs env $name" >&2
+    return 1
+  }
+  mkdir -p "$CLOUDSDK_CONFIG" || return 1
+  # gcloud keeps its credentials in a file inside this directory, on every
+  # platform — there is no keychain here. The directory IS the secret.
+  chmod 700 "$CLOUDSDK_CONFIG" 2>/dev/null
+
+  echo "cs: logging gcloud into profile '$name' ($CLOUDSDK_CONFIG)" >&2
+  gcloud auth login "$@" || return $?
+
+  # The SECOND credential, and the one people skip. `gcloud auth login` serves
+  # the gcloud command itself. This writes application_default_credentials.json,
+  # which Terraform, the client libraries, and most SDKs read.
+  echo "cs: now the application default credentials (what Terraform reads)" >&2
+  gcloud auth application-default login || return $?
+
+  local project
+  project="$(_cs_gcloud_project)"
+  if [[ -n "$project" ]]; then
+    gcloud auth application-default set-quota-project "$project" 2>/dev/null ||
+      echo "cs: could not set the quota project to '$project'; set it by hand." >&2
+  else
+    echo "cs: this profile has no project set. Some APIs reject application" >&2
+    echo "    default credentials without a quota project. Set both:" >&2
+    echo "      cs use $name" >&2
+    echo "      gcloud config set project <project>" >&2
+    echo "      gcloud auth application-default set-quota-project <project>" >&2
+  fi
+
+  echo "cs: verifying" >&2
+  _cs_gcloud_check_here "$name"
+}
+
+_cs_provider_gcloud_login() {
+  local name="$1"
+  shift
+  command -v gcloud >/dev/null 2>&1 || {
+    echo "cs: the gcloud CLI is not installed (or not in PATH)." >&2
+    return 1
+  }
+  [[ -f "$(_cs_profile_env_file "$name")" ]] || {
+    echo "cs: profile '$name' has no profile.env, so cs cannot tell gcloud where" >&2
+    echo "    to write. Create one, then run this again:" >&2
+    echo "      cs env $name" >&2
+    return 1
+  }
+  _cs_with_profile_env "$name" _cs_gcloud_login_here "$name" "$@"
+}
+
+#------------------------------------------------------------------ login dispatcher
+
+# cs login <profile> [provider] [provider args...]
+#
+# The provider is a bare word in position 2, and everything after it belongs to
+# that provider. An argument starting with '-' there is NOT a provider: it is a
+# `claude auth login` flag, which is what every `cs login` looked like before
+# providers existed. That rule is what keeps `cs login work --claudeai` working.
+_cs_login() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && {
+    echo "cs login <profile> [provider] [provider args...]" >&2
+    echo "  providers: $(_cs_provider_list)" >&2
+    return 1
+  }
+  shift
+  _cs_validate_name "$name" || {
+    echo "cs: invalid profile name '$name'" >&2
+    return 1
+  }
+
+  local provider="claude"
+  if [[ -n "${1:-}" && "$1" != -* ]]; then
+    provider="$1"
+    shift
+  fi
+  _cs_validate_provider "$provider" || {
+    echo "cs: invalid provider '$provider' (lowercase letters, digits, underscore)" >&2
+    return 1
+  }
+  if ! typeset -f "_cs_provider_${provider}_login" >/dev/null 2>&1; then
+    echo "cs: unknown provider '$provider'" >&2
+    echo "    known providers: $(_cs_provider_list)" >&2
+    return 1
+  fi
+
+  # Only the claude provider creates the profile. Every other provider logs a
+  # tool INTO an existing profile, and needs that profile's profile.env to know
+  # where the tool should write.
+  if [[ "$provider" != "claude" && ! -d "$(_cs_profile_config_dir "$name")" ]]; then
+    echo "cs: profile '$name' is not set up. Run: cs login $name" >&2
+    return 1
+  fi
+
+  "_cs_provider_${provider}_login" "$name" "$@"
 }
 
 _cs_use() {
@@ -1020,6 +1228,20 @@ _cs_doctor() {
     return 0
   }
 
+  # Ask every provider that has a check hook. A hook returns 0 healthy, 1 a real
+  # problem, 2 no opinion — and a profile that does not pin the tool must reach
+  # the 2 case and print nothing. Doctor stays quiet about tools you do not use.
+  local prov prc
+  for name in "${slots[@]}"; do
+    [[ -n "$name" ]] || continue
+    for prov in "${_CS_PROVIDERS[@]}"; do
+      typeset -f "_cs_provider_${prov}_check" >/dev/null 2>&1 || continue
+      "_cs_provider_${prov}_check" "$name"
+      prc=$?
+      ((prc == 1)) && bad=1
+    done
+  done
+
   # Report any account that shows up in more than one slot.
   local e dupes=0
   for e in "${seen_order[@]}"; do
@@ -1050,8 +1272,10 @@ _cs_help() {
 cs — per-terminal identity switcher for Claude Code and your other CLIs.
 
 Usage:
-  cs login <name> [claude auth login args...]
-                    Log a full claude.ai account into an isolated profile.
+  cs login <profile> [provider] [provider args...]
+                    Log a tool into a profile. The provider defaults to
+                    `claude`, so `cs login work` is unchanged. `cs login work
+                    gcloud` logs gcloud into that profile instead.
   cs use <name>     Pin THIS shell to a profile: exports CLAUDE_CONFIG_DIR, then
                     sources the profile's profile.env (see below).
   cs env <name>     Print the path and contents of the profile's env file.
@@ -1063,7 +1287,7 @@ Usage:
   cs list           List profiles; * marks the one pinned in this shell.
   cs doctor         Check each profile's login AND flag any account that is
                     logged into more than one namespace (the thing that causes
-                    surprise re-logins).
+                    surprise re-logins). Also runs every provider's check.
   cs current        Print the pin for this shell.
   cs rm <name>      Delete a profile's config, its keychain login, and any
                     legacy plaintext credential files left by an older cs.
@@ -1110,6 +1334,24 @@ Pinning other tools (profile.env):
   `gcloud auth revoke <account>` while that profile is pinned. A shell with no
   pin uses the shared ~/.config/gcloud directory instead, where every account
   you log in stays in one list.
+
+Providers:
+  A provider is one tool whose login cs can drive into a profile:
+
+    cs login work            # claude, the default
+    cs login work claude     # the same, written out
+    cs login work gcloud     # gcloud, into this profile's CLOUDSDK_CONFIG
+
+  The provider is a bare word in position 2. Everything after it belongs to
+  that provider, so `cs login work --claudeai` still means what it always did.
+
+  `cs login work gcloud` reads CLOUDSDK_CONFIG from the profile's profile.env,
+  runs BOTH gcloud logins there, sets the quota project, and then verifies.
+  `cs doctor` runs the same verification for every profile that pins gcloud.
+
+  Providers are plain functions, found by name. To add your own, define
+  _cs_provider_<tool>_login (and optionally _cs_provider_<tool>_check) in your
+  .zshrc, then append the name to _CS_PROVIDERS so `cs doctor` calls it.
 
 The golden rule:
   One account -> one profile, and always `cs use` before `claude`. Claude Code

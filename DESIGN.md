@@ -161,8 +161,53 @@ run the tool. `cs` cannot enforce it, because `gcloud` is not a command that
 ### Why a data file and not per-tool code
 
 A `profile.env` file makes adding a tool a data change, not a code change. The
-repository stays one small zsh file. Per-tool logic can move into
-`providers/*.zsh` later, if login or health-check behavior ever needs it.
+repository stays one small zsh file. Pinning a tool still needs no code at all.
+
+Login and health checks did eventually need code, which is what providers are.
+They live in `cs.zsh` rather than a `providers/*.zsh` directory. `cs.zsh` is
+sourced directly — by an absolute path from `.zshrc`, and by plugin managers
+from their own clone — so a sibling directory adds a path to resolve and breaks
+whenever someone copies the single file. Providers are found by function name
+instead, which costs nothing and lets a user add one from `.zshrc`. Extraction
+into files stays possible if the file ever grows too large.
+
+### Why the provider is an argument of `cs login`
+
+Two operations write identity, and they hold different state. `gcloud auth
+login` writes a credential to disk, which every later shell reads. `cs use`
+writes one shell's environment, which dies with that shell.
+
+The two do not commute. `gcloud auth login` before `cs use work` writes the
+credential to the shared `~/.config/gcloud` directory. `cs use work` before
+`gcloud auth login` writes it to the profile. The final state differs, and the
+wrong one is silent: `gcloud auth list` in the profile still looks correct,
+because the leaked credential sits somewhere else.
+
+No code can repair that ordering. The login command needs a target directory at
+the moment it runs, and an unpinned shell names the shared one. Nothing records
+which profile the user meant.
+
+Naming the profile in the login command removes the ordering instead of
+repairing it. `cs login work gcloud` is one operation, so there is no second
+operation to reorder. That is the same shape `cs login` already had for Claude
+Code, and the same shape as `cs run`: the profile is an argument, and the
+caller's shell is never pinned.
+
+The pin stays for daily work, where it earns its place. One `cs use work`
+points every tool in that terminal at the same identity.
+
+### Why check hooks have three results
+
+A provider check returns 0 for healthy, 1 for a real problem, and 2 for no
+opinion. `_cs_profile_has_credential` already used that convention, for the
+same reason: claiming a profile is broken on a guess is worse than staying
+quiet.
+
+Result 2 carries the weight here. Most profiles pin some tools and not others.
+A profile with no `profile.env`, or one that never exports `CLOUDSDK_CONFIG`,
+must produce no gcloud output at all. Without that rule `cs doctor` would report
+a missing gcloud login for every profile that never wanted one, and the report
+people actually need would drown.
 
 ### What the tracking contract buys
 

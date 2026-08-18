@@ -112,6 +112,8 @@ cs login personal --claudeai --email you@example.com
 cs login work --claudeai --email you@work.com
 ```
 
+`cs login` takes a provider as its second word, and the provider defaults to `claude`. `cs login work gcloud` logs gcloud into the same profile. See [Providers](#providers).
+
 Each login opens Claude's normal browser OAuth flow once. After that, daily switching uses the saved isolated config.
 
 > **Don't also log in unpinned.** If you run `claude` with no profile pinned, it logs into the *default* namespace. If that account also has a profile, the two will rotate each other's refresh tokens and force re-logins. Keep each account in exactly one profile.
@@ -131,7 +133,7 @@ cs run work -- -p "hi"   # one-shot: run claude as work without pinning
 cs list          # show profiles, * marks this shell's pin
 cs current       # what is this shell pinned to?
 cs env work      # show the profile's env file for other tools
-cs doctor        # verify logins + catch duplicate-account slots
+cs doctor        # verify logins, catch duplicate accounts, check providers
 cs off           # unpin this shell
 cs rm work       # delete a profile's config + keychain login
 ```
@@ -162,7 +164,15 @@ chmod 600 ~/.claude/profiles/work/profile.env
 
 ### Setting up gcloud this way
 
-Do this once per account. The `CLOUDSDK_CONFIG` export must already be active, so run `cs use` first.
+Write the profile's `profile.env` first, so `cs` knows where gcloud should write. Then run one command:
+
+```sh
+cs login work gcloud
+```
+
+That reads `CLOUDSDK_CONFIG` from the profile, runs both gcloud logins there, sets the quota project, and verifies the result. It does not pin your shell.
+
+The same setup by hand looks like this. The `CLOUDSDK_CONFIG` export must be active, so run `cs use` first.
 
 ```sh
 cs use work
@@ -263,6 +273,73 @@ The first group would break your shell. `cs off` unsets every tracked name, and 
 
 To put a per-profile directory on your `PATH`, prepend it in your `.zshrc` instead.
 
+## Providers
+
+A provider is one tool whose login `cs` can drive into a profile.
+
+```sh
+cs login work            # claude, the default
+cs login work claude     # the same command, written out
+cs login work gcloud     # gcloud, into this profile's directory
+```
+
+The provider is a bare word in position 2. Everything after it belongs to that provider, so `cs login work --claudeai --email you@work.com` still means what it always did. An argument that starts with a dash is a `claude auth login` flag, never a provider.
+
+`claude` and `gcloud` ship with `cs`.
+
+### Why the provider goes in the login command
+
+Two operations write identity. `gcloud auth login` writes a credential to disk, which persists. `cs use` sets one shell's environment, which does not.
+
+Those two operations do not commute. Run `gcloud auth login` before `cs use work` and the credential lands in the shared directory rather than the profile. Naming the profile in the login command removes the ordering, because then only one operation exists.
+
+`cs login work gcloud` therefore replaces `cs use work` plus two gcloud commands. Daily work still uses `cs use`, once per terminal.
+
+### What `cs login <profile> gcloud` does
+
+1. Reads `CLOUDSDK_CONFIG` from the profile's `profile.env`. It uses your path, and does not assume one.
+2. Runs `gcloud auth login` and `gcloud auth application-default login` there.
+3. Sets the quota project from the profile's active project.
+4. Verifies the result.
+
+The verification checks two things. The file behind `GOOGLE_APPLICATION_CREDENTIALS` must exist. `gcloud auth list` must show exactly one account.
+
+The command refuses a profile with no `profile.env`, and a `profile.env` that does not export `CLOUDSDK_CONFIG`. In both cases `cs` cannot tell where gcloud should write, and guessing would put a credential in the wrong directory.
+
+### `cs doctor` runs the same checks
+
+```sh
+cs doctor
+```
+
+`cs doctor` reports each profile's Claude account, then asks every provider about the same profile. A profile that does not pin gcloud produces no gcloud output. `cs doctor` never guesses about a tool you do not use.
+
+```text
+* work — you@work.com (claude.ai)
+  work — gcloud: you@work.com (my-project)
+  personal — you@example.com (claude.ai)
+  personal — gcloud: NO application default credentials
+```
+
+### Writing your own provider
+
+A provider is two shell functions, found by name:
+
+```sh
+_cs_provider_<tool>_login <profile> [args...]   # run that tool's login
+_cs_provider_<tool>_check <profile>             # report that tool's health
+```
+
+Define them in your `.zshrc` after you source `cs.zsh`. `cs login <profile> <tool>` finds the login hook by name. Append the name to `_CS_PROVIDERS` and `cs doctor` calls the check hook too.
+
+```sh
+_CS_PROVIDERS+=(aws)
+```
+
+A check hook returns 0 when the tool is healthy, 1 on a real problem, and 2 for no opinion. Return 2 when the profile does not pin your tool. That is what keeps `cs doctor` quiet.
+
+Use `_cs_with_profile_env <profile> <command...>` inside a hook. It applies the profile's `profile.env` in a subshell, so the caller's terminal keeps its own pin.
+
 ## The `claude` wrapper (and how to avoid it)
 
 Sourcing `cs.zsh` defines a `claude` shell function that keeps `CLAUDE_CONFIG_DIR` aligned with your pin and strips overriding auth vars before launching the real binary.
@@ -308,7 +385,7 @@ export CS_QUIET=1
 ./tests/smoke.zsh
 ```
 
-Covers profile validation, login/use/off/list/current/env/rm/doctor flows, isolated config behavior, duplicate-account detection, wrapper behavior, `profile.env` load and cleanup, and path-traversal guards.
+Covers profile validation, login/use/off/list/current/env/rm/doctor flows, isolated config behavior, duplicate-account detection, wrapper behavior, `profile.env` load and cleanup, path-traversal guards, the provider grammar, and the gcloud provider's login and check hooks.
 CI runs this suite on both macOS and Ubuntu in `.github/workflows/test.yml`.
 
 ## Design notes

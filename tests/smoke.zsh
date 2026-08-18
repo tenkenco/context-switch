@@ -149,7 +149,7 @@ SH
 
   unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE _CS_PROFILE_ENV_VARS \
     ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
-    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO 2>/dev/null
+    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO CS_TEST_GCLOUD_LOGIN_FAIL 2>/dev/null
   unfunction cs claude _cs_prev_claude _cs_validate_name _cs_profiles_root \
     _cs_profile_config_dir _cs_sha256_8 _cs_keychain_service _cs_profile_email \
     _cs_profile_is_set_up _cs_profile_has_credential _cs_keychain_scheme_intact \
@@ -157,7 +157,10 @@ SH
     _cs_profile_env_file _cs_parse_env_vars _cs_clear_profile_env \
     _cs_load_profile_env _cs_env _cs_env_find_blocked _cs_env_path_unsafe \
     _cs_source_diagnostics _cs_login _cs_login_cleanup _cs_use _cs_run _cs_off \
-    _cs_list _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
+    _cs_list _cs_current _cs_rm _cs_doctor _cs_help \
+    _cs_validate_provider _cs_provider_list _cs_with_profile_env \
+    _cs_provider_claude_login _cs_provider_gcloud_login _cs_provider_gcloud_check \
+    _cs_gcloud_login_here _cs_gcloud_check_here _cs_gcloud_project 2>/dev/null
   _CS_KC_SCHEME_CACHE=""
   source "$CS_ZSH" 2>/dev/null
 }
@@ -166,7 +169,7 @@ teardown() {
   [[ -n "${SANDBOX:-}" && -d "$SANDBOX" ]] && rm -rf "$SANDBOX"
   unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE _CS_PROFILE_ENV_VARS SANDBOX \
     ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
-    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO 2>/dev/null
+    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO CS_TEST_GCLOUD_LOGIN_FAIL 2>/dev/null
   PATH="${PATH#*:}"
 }
 
@@ -1262,6 +1265,189 @@ JSON
 
 #------------------------------------------------------------------- run
 
+# Install a fake `gcloud` that records its argv and answers `auth list` from a
+# newline-separated account list in $HOME/.gcloud-accounts. Shadows any real
+# gcloud, because the sandbox bin comes first on PATH — so these tests behave
+# the same on a laptop with the Cloud SDK and on a CI runner that ships one.
+fake_gcloud() {
+  : >"$HOME/.gcloud-accounts"
+  : >"$HOME/.gcloud-argv"
+  cat >"$SANDBOX/bin/gcloud" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >>"${HOME}/.gcloud-argv"
+printf 'CONFIG=%s\n' "${CLOUDSDK_CONFIG-}" >>"${HOME}/.gcloud-argv"
+if [ "$1" = "auth" ] && [ "$2" = "list" ]; then
+  cat "${HOME}/.gcloud-accounts"
+  exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "get-value" ]; then
+  cat "${HOME}/.gcloud-project" 2>/dev/null || printf '(unset)\n'
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "login" ]; then
+  [ -n "${CS_TEST_GCLOUD_LOGIN_FAIL-}" ] && exit 1
+  mkdir -p "$CLOUDSDK_CONFIG"
+  printf '%s\n' "login@example.com" >"${HOME}/.gcloud-accounts"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "application-default" ] && [ "$3" = "login" ]; then
+  mkdir -p "$CLOUDSDK_CONFIG"
+  printf '{}\n' >"$CLOUDSDK_CONFIG/application_default_credentials.json"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$SANDBOX/bin/gcloud"
+}
+
+# A profile.env that pins gcloud into the sandbox.
+seed_gcloud_env() {
+  local name="$1"
+  seed_profile_env "$name" "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/$name\"
+export GOOGLE_APPLICATION_CREDENTIALS=\"\$HOME/.config/gcloud-profiles/$name/application_default_credentials.json\""
+}
+
+t_login_provider_grammar() {
+  echo "[login: provider is a bare word in position 2]"
+  setup
+  local out
+  # No provider -> claude, exactly as before providers existed.
+  out="$(cs login personal 2>&1)"
+  assert_contains "defaults to claude" "$out" "FAKE_CLAUDE_AUTH_LOGIN"
+  assert_contains "keeps the claudeai default" "$out" "--claudeai"
+  # A dash argument in position 2 is a claude flag, not a provider.
+  out="$(cs login work --claudeai --email me@corp.com 2>&1)"
+  assert_contains "passthrough still works" "$out" "--email me@corp.com"
+  assert_contains "passthrough profile logged in" "$out" "saved isolated login for 'work'"
+  # The provider written out means the same thing.
+  out="$(cs login home claude --email me@home.com 2>&1)"
+  assert_contains "explicit claude provider" "$out" "--email me@home.com"
+  # Unknown and malformed providers are refused before any lookup.
+  out="$(cs login personal nope 2>&1)"
+  assert_contains "unknown provider refused" "$out" "unknown provider 'nope'"
+  assert_contains "unknown provider lists the known ones" "$out" "claude gcloud"
+  out="$(cs login personal 'Bad;Name' 2>&1)"
+  assert_contains "malformed provider refused" "$out" "invalid provider"
+  teardown
+}
+
+t_login_gcloud_provider() {
+  echo "[login: the gcloud provider]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+
+  # No profile.env -> cs cannot know where gcloud should write.
+  local out
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "refuses without profile.env" "$out" "has no profile.env"
+  assert_contains "points at cs env" "$out" "cs env work"
+
+  # A profile.env that pins nothing for gcloud is also refused.
+  seed_profile_env work 'export CS_TEST_ONE=one'
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "refuses without CLOUDSDK_CONFIG" "$out" "does not export CLOUDSDK_CONFIG"
+
+  # The real path.
+  seed_gcloud_env work
+  printf 'qbraid-staging\n' >"$HOME/.gcloud-project"
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "announces the target directory" "$out" "gcloud-profiles/work"
+  assert_contains "runs the second login" "$out" "application default credentials"
+  assert_file_exists "writes the ADC file" \
+    "$HOME/.config/gcloud-profiles/work/application_default_credentials.json"
+  local argv
+  argv="$(cat "$HOME/.gcloud-argv")"
+  assert_contains "ran auth login" "$argv" "auth login"
+  assert_contains "ran application-default login" "$argv" "auth application-default login"
+  assert_contains "set the quota project" "$argv" "set-quota-project qbraid-staging"
+  assert_contains "gcloud saw the profile's config dir" "$argv" "gcloud-profiles/work"
+  assert_contains "verification reports the account" "$out" "gcloud: login@example.com"
+
+  # An unknown profile is refused before the provider runs.
+  out="$(cs login ghost gcloud 2>&1)"
+  assert_contains "unknown profile refused" "$out" "not set up"
+
+  # A failed first login must stop there. Running the second login anyway would
+  # write application default credentials for whatever account was already
+  # active — a different account from the one the user just failed to log in.
+  seed_profile home home@example.com
+  seed_gcloud_env home
+  export CS_TEST_GCLOUD_LOGIN_FAIL=1
+  : >"$HOME/.gcloud-argv"
+  cs login home gcloud >/dev/null 2>&1
+  assert_not_eq "failed login exits non-zero" "$?" "0"
+  argv="$(cat "$HOME/.gcloud-argv")"
+  assert_not_contains "second login skipped" "$argv" "application-default login"
+  assert_file_absent "no ADC file written" \
+    "$HOME/.config/gcloud-profiles/home/application_default_credentials.json"
+  unset CS_TEST_GCLOUD_LOGIN_FAIL
+  teardown
+}
+
+t_login_gcloud_does_not_pin_the_shell() {
+  echo "[login: the gcloud provider leaves this shell alone]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  cs login work gcloud >/dev/null 2>&1
+  assert_eq "shell stays unpinned" "${_CS_PROFILE-unset}" "unset"
+  assert_eq "shell has no CLOUDSDK_CONFIG" "${CLOUDSDK_CONFIG-unset}" "unset"
+  teardown
+}
+
+t_doctor_gcloud_checks() {
+  echo "[doctor: gcloud provider checks]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  local out
+
+  # No profile.env -> no opinion, and no gcloud line at all.
+  out="$(cs doctor 2>&1)"
+  assert_not_contains "silent without profile.env" "$out" "gcloud"
+  cs doctor >/dev/null 2>&1
+  assert_eq "still exits 0" "$?" "0"
+
+  # A profile.env that does not pin gcloud is also no opinion.
+  seed_profile_env work 'export CS_TEST_ONE=one'
+  out="$(cs doctor 2>&1)"
+  assert_not_contains "silent without CLOUDSDK_CONFIG" "$out" "gcloud"
+
+  # Pinned, but never logged in.
+  seed_gcloud_env work
+  out="$(cs doctor 2>&1)"
+  assert_contains "reports no account" "$out" "gcloud: NO ACCOUNT"
+  cs doctor >/dev/null 2>&1
+  assert_eq "no account exits 1" "$?" "1"
+
+  # Logged in, but the application default credentials were never written.
+  printf 'work@corp.com\n' >"$HOME/.gcloud-accounts"
+  out="$(cs doctor 2>&1)"
+  assert_contains "reports the account" "$out" "gcloud: work@corp.com"
+  assert_contains "reports the missing ADC file" "$out" "NO application default credentials"
+  cs doctor >/dev/null 2>&1
+  assert_eq "missing ADC exits 1" "$?" "1"
+
+  # Both credentials present -> healthy and quiet.
+  mkdir -p "$HOME/.config/gcloud-profiles/work"
+  printf '{}\n' >"$HOME/.config/gcloud-profiles/work/application_default_credentials.json"
+  out="$(cs doctor 2>&1)"
+  assert_not_contains "healthy says nothing about ADC" "$out" "NO application default"
+  cs doctor >/dev/null 2>&1
+  assert_eq "healthy exits 0" "$?" "0"
+
+  # Two accounts in one profile is the leak this feature exists to catch.
+  printf 'work@corp.com\npersonal@example.com\n' >"$HOME/.gcloud-accounts"
+  out="$(cs doctor 2>&1)"
+  assert_contains "flags two accounts" "$out" "gcloud: 2 ACCOUNTS in one profile"
+  assert_contains "names the leaked account" "$out" "personal@example.com"
+  cs doctor >/dev/null 2>&1
+  assert_eq "two accounts exits 1" "$?" "1"
+  teardown
+}
+
 t_validate_name
 t_help
 t_sha256_matches_claude_scheme
@@ -1314,6 +1500,10 @@ t_credential_missing_is_reported
 t_login_abort_cleans_up
 t_rm_reports_exact_leftover_service
 t_installer
+t_login_provider_grammar
+t_login_gcloud_provider
+t_login_gcloud_does_not_pin_the_shell
+t_doctor_gcloud_checks
 
 #------------------------------------------------------------------- summary
 
