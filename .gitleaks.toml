@@ -1,7 +1,7 @@
 # gitleaks configuration — extends the built-in ruleset.
 # https://github.com/gitleaks/gitleaks
 #
-# claude-switch handles real OAuth credentials at runtime but never stores them
+# context-switch handles real OAuth credentials at runtime but never stores them
 # in the repo. This config guards against a secret being committed by accident.
 
 [extend]

@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# claude-switch smoke tests.
+# context-switch smoke tests.
 # Runs in a sandboxed $HOME with a fake claude binary on PATH so no real
 # Claude Code state or keychain is touched. Every test is independent — setup
 # creates a fresh sandbox, teardown deletes it.
@@ -140,27 +140,37 @@ fi
 # record which overriding auth vars were present at launch so scrub is testable
 printf 'API=%s TOKEN=%s BEDROCK=%s VERTEX=%s\n' "${ANTHROPIC_API_KEY-}" "${CLAUDE_CODE_OAUTH_TOKEN-}" "${CLAUDE_CODE_USE_BEDROCK-}" "${CLAUDE_CODE_USE_VERTEX-}" >"${HOME}/.claude-launch-env"
 printf 'PROFILE=%s CONFIG=%s\n' "${_CS_PROFILE-}" "${CLAUDE_CONFIG_DIR-}" >"${HOME}/.claude-launch-profile"
+# record a plain (non-auth) var so profile.env propagation is testable
+printf 'TOOLVAR=%s\n' "${CS_TEST_TOOL-}" >"${HOME}/.claude-launch-toolvar"
 printf 'FAKE_CLAUDE: %s\n' "$*"
 SH
   chmod +x "$SANDBOX/bin/claude"
   export PATH="$SANDBOX/bin:$PATH"
 
-  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE \
-    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX 2>/dev/null
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE _CS_PROFILE_ENV_VARS \
+    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO CS_TEST_GCLOUD_LOGIN_FAIL 2>/dev/null
   unfunction cs claude _cs_prev_claude _cs_validate_name _cs_profiles_root \
     _cs_profile_config_dir _cs_sha256_8 _cs_keychain_service _cs_profile_email \
     _cs_profile_is_set_up _cs_profile_has_credential _cs_keychain_scheme_intact \
     _cs_build_scrub_args _cs_find_legacy_files _cs_warn_note_vars \
+    _cs_profile_env_file _cs_parse_env_vars _cs_clear_profile_env \
+    _cs_load_profile_env _cs_env _cs_env_find_blocked _cs_env_path_unsafe \
     _cs_source_diagnostics _cs_login _cs_login_cleanup _cs_use _cs_run _cs_off \
-    _cs_list _cs_current _cs_rm _cs_doctor _cs_help 2>/dev/null
+    _cs_list _cs_current _cs_rm _cs_doctor _cs_help \
+    _cs_validate_provider _cs_provider_list _cs_with_profile_env _cs_profile_pins _cs_export_env_var_names _cs_rm_path_unsafe \
+    _cs_provider_gcloud_paths _cs_gcloud_paths_here \
+    _cs_provider_claude_login _cs_provider_gcloud_login _cs_provider_gcloud_check \
+    _cs_gcloud_login_here _cs_gcloud_check_here _cs_gcloud_project 2>/dev/null
   _CS_KC_SCHEME_CACHE=""
   source "$CS_ZSH" 2>/dev/null
 }
 
 teardown() {
   [[ -n "${SANDBOX:-}" && -d "$SANDBOX" ]] && rm -rf "$SANDBOX"
-  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE SANDBOX \
-    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX 2>/dev/null
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE _CS_PROFILE_ENV_VARS SANDBOX \
+    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO CS_TEST_GCLOUD_LOGIN_FAIL 2>/dev/null
   PATH="${PATH#*:}"
 }
 
@@ -172,6 +182,15 @@ seed_profile() {
   cat >"$cfg_dir/.claude.json" <<JSON
 {"oauthAccount":{"emailAddress":"$email","organizationUuid":"org-$name"}}
 JSON
+}
+
+# Write a profile.env for an already-seeded profile. Body is passed verbatim.
+seed_profile_env() {
+  local name="$1" body="$2"
+  local f="$HOME/.claude/profiles/$name/profile.env"
+  mkdir -p "${f:h}"
+  printf '%s\n' "$body" >"$f"
+  chmod 600 "$f"
 }
 
 # Install a fake `security` that reports exactly the service names listed in
@@ -731,6 +750,410 @@ t_rm_pinned_clears_env() {
   teardown
 }
 
+t_profile_env_applied_on_use() {
+  echo "[profile.env: applied and tracked on use]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one
+export CS_TEST_TWO="two"'
+  # Redirect rather than capture: $(...) is a subshell, so exports made by
+  # `cs use` would never reach this shell and every assertion below would lie.
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "reports what it applied" "$out" "profile.env applied"
+  assert_contains "names the first var" "$out" "CS_TEST_ONE"
+  assert_contains "names the second var" "$out" "CS_TEST_TWO"
+  assert_eq "first var exported" "${CS_TEST_ONE:-}" "one"
+  assert_eq "second var exported" "${CS_TEST_TWO:-}" "two"
+  assert_eq "tracked names recorded" "${_CS_PROFILE_ENV_VARS:-}" "CS_TEST_ONE CS_TEST_TWO"
+  zsh -c '[[ "$CS_TEST_ONE" == "one" ]]'
+  assert_eq "vars reach child shells" "$?" "0"
+  teardown
+}
+
+t_profile_env_swapped_between_profiles() {
+  echo "[profile.env: switching profiles does not leak the old one]"
+  setup
+  seed_profile personal
+  seed_profile work work@corp.com
+  seed_profile_env personal 'export CS_TEST_ONE=personal'
+  seed_profile_env work 'export CS_TEST_TWO=work'
+  cs use personal >/dev/null 2>&1
+  assert_eq "personal var set" "${CS_TEST_ONE:-}" "personal"
+  cs use work >/dev/null 2>&1
+  assert_eq "personal var gone after switch" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "work var set" "${CS_TEST_TWO:-}" "work"
+  assert_eq "tracked names replaced" "${_CS_PROFILE_ENV_VARS:-}" "CS_TEST_TWO"
+  # A profile with no env file must still clear the previous profile's vars.
+  seed_profile bare bare@example.com
+  cs use bare >/dev/null 2>&1
+  assert_eq "work var gone after bare profile" "${CS_TEST_TWO:-_NONE_}" "_NONE_"
+  assert_eq "tracking cleared" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_cleared_on_off_and_rm() {
+  echo "[profile.env: cleared by off, deleted by rm]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one'
+  cs use personal >/dev/null 2>&1
+  cs off >/dev/null 2>&1
+  assert_eq "off unsets the var" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "off clears tracking" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "_NONE_"
+
+  cs use personal >/dev/null 2>&1
+  printf 'y\n' | cs rm personal >/dev/null 2>&1
+  assert_file_absent "rm deletes the env file" "$HOME/.claude/profiles/personal/profile.env"
+  assert_eq "rm unsets the var" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "rm clears tracking" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_tracks_despite_failing_last_line() {
+  echo "[profile.env: a failing last line must not strand exported vars]"
+  setup
+  seed_profile personal
+  # `source` returns the status of the file's LAST command, so this ordinary
+  # trailing guard makes the whole load return non-zero — with CS_TEST_ONE and
+  # CS_TEST_TWO already exported.
+  seed_profile_env personal 'export CS_TEST_ONE=one
+export CS_TEST_TWO=two
+[[ -d /no/such/directory ]] && export CS_TEST_TOOL=three'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_eq "vars were exported" "${CS_TEST_ONE:-}" "one"
+  # The trailing conditional does not start with `export`, so it falls outside
+  # the documented contract and is not tracked. The plain exports above it are —
+  # that is the regression this test guards.
+  assert_eq "plain exports tracked anyway" "${_CS_PROFILE_ENV_VARS:-}" "CS_TEST_ONE CS_TEST_TWO"
+  assert_contains "reports the failing file" "$out" "returned a non-zero status"
+  assert_not_contains "does not claim success" "$out" "profile.env applied"
+  cs off >/dev/null 2>&1
+  assert_eq "off clears the first" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "off clears the second" "${CS_TEST_TWO:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_refuses_blocked_names() {
+  echo "[profile.env: refuses names that would break the shell or the pin]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one
+export PATH="/nowhere:$PATH"'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out saved_path="$PATH"
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "names the offending variable" "$out" "it sets PATH"
+  assert_eq "nothing from the file applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "nothing tracked" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "_NONE_"
+  assert_eq "PATH untouched" "$PATH" "$saved_path"
+  assert_eq "still pinned" "${_CS_PROFILE:-}" "personal"
+
+  # The pin variables are blocked for the same reason.
+  seed_profile_env personal 'export CLAUDE_CONFIG_DIR=/tmp/elsewhere'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "blocks the pin variable" "$out" "it sets CLAUDE_CONFIG_DIR"
+  assert_eq "config dir still correct" "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude/profiles/personal"
+  teardown
+}
+
+t_profile_env_pin_survives_bare_assignment() {
+  echo "[profile.env: a bare assignment cannot move the pin]"
+  setup
+  seed_profile personal
+  # No `export`, so the blocked-name parser does not see it — but the variable
+  # is already exported, so the assignment still changes it.
+  seed_profile_env personal 'CLAUDE_CONFIG_DIR=/tmp/elsewhere'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "reports the correction" "$out" "moved the pin"
+  assert_eq "config dir restored" "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude/profiles/personal"
+  assert_eq "profile restored" "${_CS_PROFILE:-}" "personal"
+  teardown
+}
+
+t_profile_env_use_reports_failure_status() {
+  echo "[profile.env: cs use exits non-zero when the env file is refused]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one'
+  cs use personal >/dev/null 2>&1
+  assert_eq "healthy file exits 0" "$?" "0"
+  chmod 666 "$HOME/.claude/profiles/personal/profile.env"
+  cs use personal >/dev/null 2>&1
+  assert_eq "refused file exits non-zero" "$?" "1"
+  teardown
+}
+
+t_profile_env_symlink_permissions_checked() {
+  echo "[profile.env: the writability guard follows a symlink]"
+  setup
+  seed_profile personal
+  local target="$SANDBOX/exposed.env"
+  printf 'export CS_TEST_ONE=one\n' >"$target"
+  chmod 666 "$target"
+  ln -s "$target" "$HOME/.claude/profiles/personal/profile.env"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "refuses the symlinked file" "$out" "group- or world-writable"
+  assert_eq "var not exported" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_refuses_writable_directory() {
+  echo "[profile.env: refuses a profile directory others can write]"
+  setup
+  seed_profile personal
+  # The FILE is immaculate. The DIRECTORY is not, so an attacker can delete the
+  # file and drop in their own 0600 copy that passes every check on the file.
+  seed_profile_env personal 'export CS_TEST_ONE=attacker'
+  chmod 777 "$HOME/.claude/profiles/personal"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "explains the directory is unsafe" "$out" "its directory"
+  assert_contains "names the permission problem" "$out" "group- or world-writable"
+  assert_eq "nothing from the file applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "still pinned" "${_CS_PROFILE:-}" "personal"
+  chmod 700 "$HOME/.claude/profiles/personal"
+  cs use personal >/dev/null 2>&1
+  assert_eq "loads once the directory is fixed" "${CS_TEST_ONE:-}" "attacker"
+  teardown
+}
+
+t_profile_env_clear_ignores_blocked_names() {
+  echo "[profile.env: cs off never unsets a protected name]"
+  setup
+  seed_profile personal
+  # _CS_PROFILE_ENV_VARS is exported, so it can reach this shell from a parent
+  # process or a stale session rather than from a file cs parsed. Honoring a
+  # PATH entry in it would leave a shell that cannot run a single command.
+  export _CS_PROFILE_ENV_VARS="PATH HOME CS_TEST_ONE"
+  export CS_TEST_ONE=one
+  local saved_path="$PATH"
+  cs off >/dev/null 2>&1
+  assert_eq "PATH survives" "$PATH" "$saved_path"
+  assert_not_eq "HOME survives" "${HOME:-}" ""
+  assert_eq "the ordinary name is still cleared" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "tracking cleared" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_tracks_multiple_exports_per_line() {
+  echo "[profile.env: two exports on one line are both tracked]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one CS_TEST_TWO=two'
+  cs use personal >/dev/null 2>&1
+  assert_eq "both applied" "${CS_TEST_ONE:-}/${CS_TEST_TWO:-}" "one/two"
+  assert_eq "both tracked" "${_CS_PROFILE_ENV_VARS:-}" "CS_TEST_ONE CS_TEST_TWO"
+  cs off >/dev/null 2>&1
+  assert_eq "both cleared" "${CS_TEST_ONE:-_NONE_}/${CS_TEST_TWO:-_NONE_}" "_NONE_/_NONE_"
+
+  # A QUOTED line with two candidates is ambiguous: cs cannot tell a real name
+  # from text inside a quoted value without implementing shell quoting. Guessing
+  # the first one was a security hole, not just an incomplete feature — see
+  # t_profile_env_quoted_multi_cannot_smuggle_blocked_name. Refuse instead.
+  teardown
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE="a CS_TEST_TWO=decoy"'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "refuses the ambiguous line" "$out" "cannot read the variable name"
+  assert_contains "says how to fix it" "$out" "must set exactly one variable"
+  assert_eq "nothing applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+
+  # A quoted line yielding ZERO readable names is just as uncertain. It exports
+  # a variable cs cannot see, so cs could never unset it on the next `cs use`.
+  teardown
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export "CS_TEST_ONE"=leaks'
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "refuses an unreadable quoted name" "$out" "cannot read the variable name"
+  assert_eq "the invisible export never applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_not_contains "does not claim success" "$out" "profile.env applied"
+  teardown
+}
+
+t_profile_env_quoted_multi_cannot_smuggle_blocked_name() {
+  echo "[profile.env: a quoted line cannot smuggle a blocked name past the check]"
+  setup
+  seed_profile personal
+  # The blocked-name check runs on parsed names. A parser that kept only the
+  # FIRST name on a quoted line let PATH through untracked and unchecked: the
+  # file was sourced and the shell was left unable to run any command.
+  seed_profile_env personal 'export CS_TEST_ONE="yes" PATH="/nowhere"'
+  local saved_path="$PATH"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "refuses the file" "$out" "cannot read the variable name"
+  assert_eq "PATH untouched" "$PATH" "$saved_path"
+  assert_eq "the shell can still run commands" "$(command -v env >/dev/null && echo yes || echo no)" "yes"
+  assert_eq "nothing applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_not_contains "does not claim success" "$out" "profile.env applied"
+  teardown
+}
+
+t_profile_env_survives_hostile_ifs() {
+  echo "[profile.env: a bare IFS assignment cannot strand the cleanup]"
+  setup
+  seed_profile personal
+  # `export IFS=` is blocked, but a BARE assignment is invisible to the parser
+  # and still changes the shell. cs off must split its own record regardless.
+  seed_profile_env personal 'export CS_TEST_ONE=one
+export CS_TEST_TWO=two
+IFS=,'
+  local saved_ifs="$IFS"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_eq "both applied" "${CS_TEST_ONE:-}/${CS_TEST_TWO:-}" "one/two"
+  assert_eq "IFS restored in the caller's shell" "$IFS" "$saved_ifs"
+  assert_contains "says it restored IFS" "$out" "changed IFS"
+  cs off >/dev/null 2>&1
+  assert_eq "first cleared" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "second cleared" "${CS_TEST_TWO:-_NONE_}" "_NONE_"
+  assert_eq "shell fully unpinned" "${_CS_PROFILE:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_bare_path_assignment_restored() {
+  echo "[profile.env: a bare PATH assignment is restored, not left broken]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one
+PATH=/nowhere'
+  local saved_path="$PATH"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_eq "PATH restored" "$PATH" "$saved_path"
+  assert_contains "says it restored PATH" "$out" "changed PATH"
+  assert_eq "the ordinary export still applied" "${CS_TEST_ONE:-}" "one"
+  teardown
+}
+
+t_profile_env_tracking_survives_self_unset() {
+  echo "[profile.env: a file cannot disable its own cleanup]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one
+export CS_TEST_TWO=two
+unset _CS_PROFILE_ENV_VARS'
+  cs use personal >/dev/null 2>&1
+  assert_eq "record re-asserted after sourcing" "${_CS_PROFILE_ENV_VARS:-_NONE_}" "CS_TEST_ONE CS_TEST_TWO"
+  cs off >/dev/null 2>&1
+  assert_eq "first cleared" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  assert_eq "second cleared" "${CS_TEST_TWO:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_symlink_target_directory_checked() {
+  echo "[profile.env: the symlink target's directory is checked too]"
+  setup
+  seed_profile personal
+  # File mode is perfect and the profile dir is 0700. The target's DIRECTORY is
+  # what a teammate could write, and that is where the file can be replaced.
+  local shared="$SANDBOX/shared"
+  mkdir -p "$shared"
+  printf 'export CS_TEST_ONE=one\n' >"$shared/env.sh"
+  chmod 600 "$shared/env.sh"
+  chmod 777 "$shared"
+  ln -s "$shared/env.sh" "$HOME/.claude/profiles/personal/profile.env"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "refuses on the target's directory" "$out" "its directory"
+  assert_eq "nothing applied" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_profile_env_run_clears_caller_env() {
+  echo "[profile.env: cs run does not leak the caller's profile into the child]"
+  setup
+  seed_profile work work@corp.com
+  seed_profile home home@example.com
+  seed_profile_env work 'export CS_TEST_TOOL=fromwork'
+  # `home` deliberately has NO profile.env — the caller's value must still go.
+  cs use work >/dev/null 2>&1
+  cs run home -- --version >/dev/null 2>&1
+  assert_eq "child did not inherit work's var" "$(<"$HOME/.claude-launch-toolvar")" "TOOLVAR="
+  assert_eq "caller keeps its own pin" "${_CS_PROFILE:-}" "work"
+  assert_eq "caller keeps its own var" "${CS_TEST_TOOL:-}" "fromwork"
+  teardown
+}
+
+t_profile_env_refuses_world_writable() {
+  echo "[profile.env: refuses a file others can write]"
+  setup
+  seed_profile personal
+  seed_profile_env personal 'export CS_TEST_ONE=one'
+  chmod 666 "$HOME/.claude/profiles/personal/profile.env"
+  cs use personal >|"$SANDBOX/.out" 2>&1
+  local out
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "explains the refusal" "$out" "group- or world-writable"
+  assert_eq "var not exported" "${CS_TEST_ONE:-_NONE_}" "_NONE_"
+  # The Claude pin must still succeed — a bad env file is not a reason to leave
+  # the shell pointing at the previous account.
+  assert_eq "still pinned to the profile" "${_CS_PROFILE:-}" "personal"
+  teardown
+}
+
+t_profile_env_reaches_run_without_pinning() {
+  echo "[profile.env: cs run passes it to the child, leaves the shell alone]"
+  setup
+  seed_profile work work@corp.com
+  seed_profile_env work 'export CS_TEST_TOOL=fromwork'
+  cs run work -- --version >/dev/null 2>&1
+  assert_eq "child saw the var" "$(<"$HOME/.claude-launch-toolvar")" "TOOLVAR=fromwork"
+  assert_eq "caller shell not given the var" "${CS_TEST_TOOL:-_NONE_}" "_NONE_"
+  assert_eq "caller shell not pinned" "${_CS_PROFILE:-_NONE_}" "_NONE_"
+  teardown
+}
+
+t_env_subcommand() {
+  echo "[env: prints the path and contents]"
+  setup
+  seed_profile personal
+  local out
+  out="$(cs env personal 2>&1)"
+  assert_contains "prints the path" "$out" "profiles/personal/profile.env"
+  assert_contains "offers a template when absent" "$out" "no env file yet"
+  seed_profile_env personal 'export CS_TEST_ONE=one'
+  out="$(cs env personal 2>&1)"
+  assert_contains "prints the contents" "$out" "export CS_TEST_ONE=one"
+  out="$(cs env ghost 2>&1)"
+  assert_contains "missing profile" "$out" "not set up"
+  out="$(cs env ../foo 2>&1)"
+  assert_contains "rejects traversal" "$out" "invalid profile name"
+  teardown
+}
+
+t_list_marks_env_profiles() {
+  echo "[list: flags profiles that pin other tools]"
+  setup
+  seed_profile personal
+  seed_profile work work@corp.com
+  seed_profile_env work 'export CS_TEST_ONE=one'
+  local out
+  out="$(cs list 2>&1)"
+  assert_contains "work marked" "$out" "work@corp.com [+env]"
+  assert_not_contains "personal not marked" "$out" "personal@example.com [+env]"
+  teardown
+}
+
 t_doctor_healthy_and_duplicate() {
   echo "[doctor: healthy profiles + duplicate-account detection]"
   setup
@@ -855,6 +1278,581 @@ JSON
 
 #------------------------------------------------------------------- run
 
+# Install a fake `gcloud` that records its argv and answers `auth list` from a
+# newline-separated account list in $HOME/.gcloud-accounts. Shadows any real
+# gcloud, because the sandbox bin comes first on PATH — so these tests behave
+# the same on a laptop with the Cloud SDK and on a CI runner that ships one.
+fake_gcloud() {
+  : >"$HOME/.gcloud-accounts"
+  : >"$HOME/.gcloud-argv"
+  cat >"$SANDBOX/bin/gcloud" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >>"${HOME}/.gcloud-argv"
+printf 'CONFIG=%s\n' "${CLOUDSDK_CONFIG-}" >>"${HOME}/.gcloud-argv"
+if [ "$1" = "auth" ] && [ "$2" = "list" ]; then
+  cat "${HOME}/.gcloud-accounts"
+  exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "get-value" ]; then
+  cat "${HOME}/.gcloud-project" 2>/dev/null || printf '(unset)\n'
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "login" ]; then
+  [ -n "${CS_TEST_GCLOUD_LOGIN_FAIL-}" ] && exit 1
+  mkdir -p "$CLOUDSDK_CONFIG"
+  printf '%s\n' "login@example.com" >"${HOME}/.gcloud-accounts"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "application-default" ] && [ "$3" = "login" ]; then
+  mkdir -p "$CLOUDSDK_CONFIG"
+  printf '{}\n' >"$CLOUDSDK_CONFIG/application_default_credentials.json"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$SANDBOX/bin/gcloud"
+}
+
+# A profile.env that pins gcloud into the sandbox.
+seed_gcloud_env() {
+  local name="$1"
+  seed_profile_env "$name" "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/$name\"
+export GOOGLE_APPLICATION_CREDENTIALS=\"\$HOME/.config/gcloud-profiles/$name/application_default_credentials.json\""
+}
+
+t_login_provider_grammar() {
+  echo "[login: provider is a bare word in position 2]"
+  setup
+  local out
+  # No provider -> claude, exactly as before providers existed.
+  out="$(cs login personal 2>&1)"
+  assert_contains "defaults to claude" "$out" "FAKE_CLAUDE_AUTH_LOGIN"
+  assert_contains "keeps the claudeai default" "$out" "--claudeai"
+  # A dash argument in position 2 is a claude flag, not a provider.
+  out="$(cs login work --claudeai --email me@corp.com 2>&1)"
+  assert_contains "passthrough still works" "$out" "--email me@corp.com"
+  assert_contains "passthrough profile logged in" "$out" "saved isolated login for 'work'"
+  # The provider written out means the same thing.
+  out="$(cs login home claude --email me@home.com 2>&1)"
+  assert_contains "explicit claude provider" "$out" "--email me@home.com"
+  # Unknown and malformed providers are refused before any lookup.
+  out="$(cs login personal nope 2>&1)"
+  assert_contains "unknown provider refused" "$out" "unknown provider 'nope'"
+  assert_contains "unknown provider lists the known ones" "$out" "claude gcloud"
+  out="$(cs login personal 'Bad;Name' 2>&1)"
+  assert_contains "malformed provider refused" "$out" "invalid provider"
+  teardown
+}
+
+t_login_gcloud_provider() {
+  echo "[login: the gcloud provider]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+
+  # No profile.env -> cs cannot know where gcloud should write.
+  local out
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "refuses without profile.env" "$out" "has no profile.env"
+  assert_contains "points at cs env" "$out" "cs env work"
+
+  # A profile.env that pins nothing for gcloud is also refused.
+  seed_profile_env work 'export CS_TEST_ONE=one'
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "refuses without CLOUDSDK_CONFIG" "$out" "does not export CLOUDSDK_CONFIG"
+
+  # The real path.
+  seed_gcloud_env work
+  printf 'qbraid-staging\n' >"$HOME/.gcloud-project"
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "announces the target directory" "$out" "gcloud-profiles/work"
+  assert_contains "runs the second login" "$out" "application default credentials"
+  assert_file_exists "writes the ADC file" \
+    "$HOME/.config/gcloud-profiles/work/application_default_credentials.json"
+  local argv
+  argv="$(cat "$HOME/.gcloud-argv")"
+  assert_contains "ran auth login" "$argv" "auth login"
+  assert_contains "ran application-default login" "$argv" "auth application-default login"
+  assert_contains "set the quota project" "$argv" "set-quota-project qbraid-staging"
+  assert_contains "gcloud saw the profile's config dir" "$argv" "gcloud-profiles/work"
+  assert_contains "verification reports the account" "$out" "gcloud: login@example.com"
+
+  # An unknown profile is refused before the provider runs.
+  out="$(cs login ghost gcloud 2>&1)"
+  assert_contains "unknown profile refused" "$out" "not set up"
+
+  # A failed first login must stop there. Running the second login anyway would
+  # write application default credentials for whatever account was already
+  # active — a different account from the one the user just failed to log in.
+  seed_profile home home@example.com
+  seed_gcloud_env home
+  export CS_TEST_GCLOUD_LOGIN_FAIL=1
+  : >"$HOME/.gcloud-argv"
+  cs login home gcloud >/dev/null 2>&1
+  assert_not_eq "failed login exits non-zero" "$?" "0"
+  argv="$(cat "$HOME/.gcloud-argv")"
+  assert_not_contains "second login skipped" "$argv" "application-default login"
+  assert_file_absent "no ADC file written" \
+    "$HOME/.config/gcloud-profiles/home/application_default_credentials.json"
+  unset CS_TEST_GCLOUD_LOGIN_FAIL
+  teardown
+}
+
+t_login_gcloud_does_not_pin_the_shell() {
+  echo "[login: the gcloud provider leaves this shell alone]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  cs login work gcloud >/dev/null 2>&1
+  assert_eq "shell stays unpinned" "${_CS_PROFILE-unset}" "unset"
+  assert_eq "shell has no CLOUDSDK_CONFIG" "${CLOUDSDK_CONFIG-unset}" "unset"
+  teardown
+}
+
+t_provider_output_is_not_mixed_with_profile_env_output() {
+  echo "[providers: profile.env output never reaches a hook's channel]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # A profile.env that prints something. A banner, a `mkdir -pv`, a sourced
+  # helper — all ordinary. cs rm reads a hook's stdout as directories to delete,
+  # so a printed path must never land there.
+  seed_profile_env work "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/work\"
+echo \"\$HOME/Documents\""
+  mkdir -p "$HOME/Documents"
+  printf 'my thesis' >"$HOME/Documents/thesis.txt"
+  cs login work gcloud >/dev/null 2>&1
+
+  # Capture stdout ONLY. The printed line still reaches the user, on stderr;
+  # what must not happen is cs treating it as a directory to delete.
+  local out
+  out="$(printf 'y\n' | cs rm work 2>/dev/null)"
+  assert_not_contains "the printed path is not offered for deletion" "$out" "Documents"
+  assert_file_exists "and it still exists" "$HOME/Documents/thesis.txt"
+  assert_dir_absent "the real provider directory is still deleted" \
+    "$HOME/.config/gcloud-profiles/work"
+
+  # doctor reads a check hook's stdout the same way, so a profile.env must not
+  # be able to write a line into the report.
+  seed_profile home home@corp.com
+  seed_profile_env home "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/home\"
+echo 'home — gcloud: attacker@evil.example (spoofed)'"
+  printf 'real@corp.com\n' >"$HOME/.gcloud-accounts"
+  out="$(cs doctor 2>/dev/null)"
+  assert_not_contains "a profile.env cannot forge a doctor line" "$out" "spoofed"
+  teardown
+}
+
+t_gcloud_refuses_an_unsafe_credential_directory() {
+  echo "[gcloud: the credential directory is checked before any login]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+
+  # A symlink standing in for the directory would send the refresh token
+  # wherever it points.
+  mkdir -p "$HOME/attacker"
+  mkdir -p "$HOME/.config/gcloud-profiles"
+  ln -s "$HOME/attacker" "$HOME/.config/gcloud-profiles/work"
+  seed_gcloud_env work
+  local out
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "refuses a symlinked directory" "$out" "is a symlink"
+  assert_eq "gcloud was never run" "$(cat "$HOME/.gcloud-argv")" ""
+  assert_file_absent "no credential reached the attacker's directory" \
+    "$HOME/attacker/application_default_credentials.json"
+
+  # A world-writable directory that you own is repaired, not refused: cs sets
+  # 0700 before the login runs, so the refresh token never lands in a directory
+  # someone else can read.
+  rm -f "$HOME/.config/gcloud-profiles/work"
+  mkdir -p "$HOME/.config/gcloud-profiles/work"
+  chmod 777 "$HOME/.config/gcloud-profiles/work"
+  cs login work gcloud >/dev/null 2>&1
+  local mode
+  mode="$(_cs_env_path_unsafe "$HOME/.config/gcloud-profiles/work" || echo safe)"
+  assert_eq "a world-writable directory is tightened first" "$mode" "safe"
+
+  # The normal case still works, and the directory it creates is private.
+  rm -rf "$HOME/.config/gcloud-profiles"
+  cs login work gcloud >/dev/null 2>&1
+  assert_file_exists "the login wrote the credential" \
+    "$HOME/.config/gcloud-profiles/work/application_default_credentials.json"
+  local mode
+  mode="$(_cs_env_path_unsafe "$HOME/.config/gcloud-profiles/work" || echo safe)"
+  assert_eq "the directory is private" "$mode" "safe"
+  mode="$(_cs_env_path_unsafe "$HOME/.config/gcloud-profiles" || echo safe)"
+  assert_eq "so is the directory above it" "$mode" "safe"
+  teardown
+}
+
+t_rm_guard_normalizes_paths() {
+  echo "[rm: the delete guard normalizes before comparing]"
+  setup
+  # A raw string test is defeated by a trailing slash, a '.' component, or a
+  # symlink — all ordinary ways to write a directory in a profile.env.
+  local p
+  for p in "$HOME/.config/gcloud" "$HOME/.config/gcloud/" "$HOME/.config/gcloud/." \
+    "$HOME/./.config/gcloud" "$HOME/.config" "$HOME/.config/" "$HOME" "$HOME/" \
+    "$HOME/.claude" "$HOME/.claude/profiles" "/" "relative/path" \
+    "$HOME/.ssh" "$HOME/.aws" "$HOME/.gnupg" "$HOME/Documents" "/etc"; do
+    if _cs_rm_path_unsafe "$p" >/dev/null 2>&1; then
+      _pass "refuses $p"
+    else
+      _fail "refuses $p" "the guard allowed it"
+    fi
+  done
+  # A real per-profile directory must still be deletable. It has to exist and be
+  # private, because the guard now applies the same ownership and mode test cs
+  # uses before it sources profile.env.
+  mkdir -p "$HOME/.config/gcloud-profiles/work"
+  chmod 700 "$HOME/.config/gcloud-profiles/work"
+  if _cs_rm_path_unsafe "$HOME/.config/gcloud-profiles/work" >/dev/null 2>&1; then
+    _fail "allows a per-profile directory" "the guard refused it"
+  else
+    _pass "allows a per-profile directory"
+  fi
+
+  # A world-writable one is not cs's to delete.
+  mkdir -p "$HOME/.config/gcloud-profiles/loose"
+  chmod 777 "$HOME/.config/gcloud-profiles/loose"
+  if _cs_rm_path_unsafe "$HOME/.config/gcloud-profiles/loose" >/dev/null 2>&1; then
+    _pass "refuses a world-writable directory"
+  else
+    _fail "refuses a world-writable directory" "the guard allowed it"
+  fi
+
+  # Nor is a symlink standing in for one: the guard compares resolved paths, so
+  # deleting through the link would destroy whatever it points at.
+  mkdir -p "$HOME/victim"
+  ln -s "$HOME/victim" "$HOME/.config/gcloud-profiles/linked"
+  if _cs_rm_path_unsafe "$HOME/.config/gcloud-profiles/linked" >/dev/null 2>&1; then
+    _pass "refuses a symlinked provider directory"
+  else
+    _fail "refuses a symlinked provider directory" "the guard allowed it"
+  fi
+  teardown
+}
+
+t_rm_warns_when_it_cannot_read_provider_paths() {
+  echo "[rm: never drops provider paths in silence]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  cs login work gcloud >/dev/null 2>&1
+  local gdir="$HOME/.config/gcloud-profiles/work"
+  assert_file_exists "the login wrote credentials" "$gdir/application_default_credentials.json"
+
+  # Now make profile.env unreadable. cs rm deletes the profile, which takes the
+  # only record of where that gcloud directory is — so it must say so.
+  chmod 666 "$HOME/.claude/profiles/work/profile.env"
+  local out
+  out="$(printf 'y\n' | cs rm work 2>&1)"
+  assert_contains "warns that it cannot read profile.env" "$out" "could not read profile.env"
+  assert_contains "says the directories are not deleted" "$out" "will NOT be"
+  assert_contains "gives the reason" "$out" "group- or world-writable"
+  assert_file_exists "the credentials are still findable" \
+    "$gdir/application_default_credentials.json"
+  teardown
+}
+
+t_env_trailing_conditional_still_applies() {
+  echo "[profile.env: a trailing conditional does not block a provider]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # The file's own comments call this pattern ordinary: `source` returns the
+  # status of the LAST command, and this one is false on most machines.
+  seed_profile_env work "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/work\"
+export GOOGLE_APPLICATION_CREDENTIALS=\"\$HOME/.config/gcloud-profiles/work/application_default_credentials.json\"
+[[ -d \"\$HOME/definitely-not-here\" ]] && export CS_TEST_ONE=1"
+  local out
+  out="$(cs login work gcloud 2>&1)"
+  assert_not_contains "does not call the file unusable" "$out" "unusable"
+  assert_contains "the login runs" "$out" "gcloud-profiles/work"
+  assert_file_exists "and writes the credential" \
+    "$HOME/.config/gcloud-profiles/work/application_default_credentials.json"
+
+  # cs rm must still find the directory through that same file.
+  out="$(printf 'y\n' | cs rm work 2>&1)"
+  assert_contains "rm still finds the directory" "$out" "gcloud-profiles/work"
+  assert_dir_absent "and deletes it" "$HOME/.config/gcloud-profiles/work"
+  teardown
+}
+
+t_env_parser_ignores_comments() {
+  echo "[profile.env: an unquoted comment is not a variable name]"
+  setup
+  seed_profile work
+  # A phantom name in a comment must not be tracked, and must not be unset.
+  seed_profile_env work 'export CS_TEST_ONE=one # note CS_TEST_TWO=2'
+  export CS_TEST_TWO="mine"
+  cs use work >/dev/null 2>&1
+  assert_eq "comment name not tracked" "$_CS_PROFILE_ENV_VARS" "CS_TEST_ONE"
+  cs off >/dev/null 2>&1
+  assert_eq "the shell's own variable survives" "${CS_TEST_TWO-gone}" "mine"
+  unset CS_TEST_TWO
+
+  # A blocked name inside a comment must not get the file refused.
+  seed_profile_env work 'export CS_TEST_ONE=one # legacy PATH=/nowhere'
+  local out
+  out="$(cs use work 2>&1)"
+  assert_not_contains "no false refusal" "$out" "refusing to load"
+  assert_contains "the real export applies" "$out" "profile.env applied — CS_TEST_ONE"
+  cs off >/dev/null 2>&1
+
+  # A '#' inside a quoted value is part of the value, not a comment.
+  seed_profile_env work 'export CS_TEST_ONE="a#b"'
+  cs use work >/dev/null 2>&1
+  assert_eq "quoted hash kept" "$CS_TEST_ONE" "a#b"
+  cs off >/dev/null 2>&1
+
+  # A real second export on the same line is still tracked.
+  seed_profile_env work 'export CS_TEST_ONE=one CS_TEST_TWO=two # trailing'
+  cs use work >/dev/null 2>&1
+  assert_eq "both real names tracked" "$_CS_PROFILE_ENV_VARS" "CS_TEST_ONE CS_TEST_TWO"
+  cs off >/dev/null 2>&1
+  teardown
+}
+
+t_env_tracking_survives_a_custom_ifs() {
+  echo "[profile.env: tracking does not depend on the caller's IFS]"
+  setup
+  seed_profile work
+  seed_profile_env work 'export CS_TEST_ONE=one
+export CS_TEST_TWO=two'
+  local saved="$IFS"
+  IFS=,
+  cs use work >/dev/null 2>&1
+  assert_eq "names joined on whitespace" "$_CS_PROFILE_ENV_VARS" "CS_TEST_ONE CS_TEST_TWO"
+  cs off >/dev/null 2>&1
+  assert_eq "first name unset" "${CS_TEST_ONE-gone}" "gone"
+  assert_eq "second name unset" "${CS_TEST_TWO-gone}" "gone"
+  IFS="$saved"
+  teardown
+}
+
+t_gcloud_usage_error_is_not_a_broken_env_file() {
+  echo "[gcloud: the tool's own exit 2 is not a profile.env failure]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  # gcloud uses argparse, which exits 2 on a usage error.
+  cat >"$SANDBOX/bin/gcloud" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >>"${HOME}/.gcloud-argv"
+exit 2
+SH
+  chmod +x "$SANDBOX/bin/gcloud"
+  local out
+  out="$(cs login work gcloud --bogus-flag 2>&1)"
+  assert_not_contains "does not blame profile.env" "$out" "unusable"
+  assert_contains "the login was attempted" "$(cat "$HOME/.gcloud-argv")" "--bogus-flag"
+  cs login work gcloud --bogus-flag >/dev/null 2>&1
+  assert_eq "gcloud's own status is passed through" "$?" "2"
+  teardown
+}
+
+t_rm_removes_provider_credentials() {
+  echo "[rm: deletes the profile's gcloud directory too]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  cs login work gcloud >/dev/null 2>&1
+  local gdir="$HOME/.config/gcloud-profiles/work"
+  assert_file_exists "the login wrote credentials" "$gdir/application_default_credentials.json"
+
+  local out
+  out="$(printf 'y\n' | cs rm work 2>&1)"
+  assert_contains "names the directory before deleting" "$out" "$gdir"
+  assert_contains "the prompt mentions provider credentials" "$out" "provider credentials"
+  assert_dir_absent "the gcloud directory is gone" "$gdir"
+  assert_dir_absent "the profile is gone" "$HOME/.claude/profiles/work"
+  teardown
+}
+
+t_rm_refuses_a_shared_directory() {
+  echo "[rm: never deletes a shared gcloud directory]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # A profile.env that points at gcloud's own shared directory.
+  seed_profile_env work "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud\""
+  mkdir -p "$HOME/.config/gcloud"
+  printf '{}\n' >"$HOME/.config/gcloud/credentials.db"
+  local out
+  out="$(printf 'y\n' | cs rm work 2>&1)"
+  assert_contains "says it refused" "$out" "refusing to delete"
+  assert_contains "explains why" "$out" "shared configuration directory"
+  assert_file_exists "the shared directory survives" "$HOME/.config/gcloud/credentials.db"
+  assert_dir_absent "the profile is still removed" "$HOME/.claude/profiles/work"
+  teardown
+}
+
+t_gcloud_ignores_inherited_config() {
+  echo "[gcloud: a CLOUDSDK_CONFIG from the user's shell is never used]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # A profile.env that pins other things, but nothing for gcloud.
+  seed_profile_env work 'export CS_TEST_ONE=one'
+  # ...and a shell that exports gcloud's shared directory, as a .zshrc would.
+  export CLOUDSDK_CONFIG="$HOME/.config/gcloud"
+  printf 'a@example.com\nb@example.com\n' >"$HOME/.gcloud-accounts"
+
+  local out
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "login refuses" "$out" "does not export CLOUDSDK_CONFIG"
+  assert_contains "login names the inherited value" "$out" "cs will not use it"
+  assert_eq "gcloud was never run" "$(cat "$HOME/.gcloud-argv")" ""
+  assert_file_absent "no credential in the shared directory" \
+    "$HOME/.config/gcloud/application_default_credentials.json"
+
+  # doctor must not report the shell's accounts under this profile's name.
+  out="$(cs doctor 2>&1)"
+  assert_not_contains "doctor stays silent" "$out" "gcloud"
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor exits 0" "$?" "0"
+  unset CLOUDSDK_CONFIG
+  teardown
+}
+
+t_gcloud_ignores_inherited_adc_path() {
+  echo "[gcloud: an inherited GOOGLE_APPLICATION_CREDENTIALS is not judged]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # This profile pins the directory but NOT the ADC path.
+  seed_profile_env work "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/work\""
+  printf 'work@corp.com\n' >"$HOME/.gcloud-accounts"
+  # The shell names an ADC file that does not exist.
+  export GOOGLE_APPLICATION_CREDENTIALS="$HOME/nowhere/adc.json"
+
+  local out
+  out="$(cs doctor 2>&1)"
+  assert_contains "reports the account" "$out" "gcloud: work@corp.com"
+  assert_not_contains "no false ADC failure" "$out" "NO application default"
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor exits 0" "$?" "0"
+  unset GOOGLE_APPLICATION_CREDENTIALS
+  teardown
+}
+
+t_gcloud_adc_outside_the_config_dir() {
+  echo "[gcloud: an ADC path outside CLOUDSDK_CONFIG gets different advice]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_profile_env work "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-profiles/work\"
+export GOOGLE_APPLICATION_CREDENTIALS=\"\$HOME/keys/work-sa.json\""
+  printf 'work@corp.com\n' >"$HOME/.gcloud-accounts"
+  local out
+  out="$(cs doctor 2>&1)"
+  assert_contains "still reports the missing file" "$out" "NO application default credentials"
+  assert_contains "explains no login writes it" "$out" "no login writes it"
+  assert_not_contains "does not suggest a login that cannot help" "$out" "Fix: cs login work gcloud"
+  teardown
+}
+
+t_gcloud_unusable_env_file() {
+  echo "[gcloud: an unusable profile.env is not a gcloud failure]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # A refused file: cs never manages PATH.
+  seed_profile_env work 'export PATH=/nowhere'
+
+  local out
+  out="$(cs doctor 2>&1)"
+  assert_contains "doctor explains the refusal" "$out" "refusing to load"
+  assert_not_contains "doctor blames no gcloud account" "$out" "NO ACCOUNT"
+  cs doctor >/dev/null 2>&1
+  assert_eq "doctor does not fail on it" "$?" "0"
+
+  out="$(cs login work gcloud 2>&1)"
+  assert_contains "login says no login ran" "$out" "no gcloud login ran"
+  assert_eq "gcloud was never run" "$(cat "$HOME/.gcloud-argv")" ""
+  cs login work gcloud >/dev/null 2>&1
+  assert_not_eq "login exits non-zero" "$?" "0"
+  teardown
+}
+
+t_gcloud_args_reach_both_logins() {
+  echo "[gcloud: extra arguments reach both logins]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  cs login work gcloud --no-launch-browser >/dev/null 2>&1
+  local argv
+  argv="$(cat "$HOME/.gcloud-argv")"
+  assert_contains "first login got the flag" "$argv" "auth login --no-launch-browser"
+  assert_contains "second login got the flag" "$argv" \
+    "auth application-default login --no-launch-browser"
+  teardown
+}
+
+t_doctor_gcloud_checks() {
+  echo "[doctor: gcloud provider checks]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  local out
+
+  # No profile.env -> no opinion, and no gcloud line at all.
+  out="$(cs doctor 2>&1)"
+  assert_not_contains "silent without profile.env" "$out" "gcloud"
+  cs doctor >/dev/null 2>&1
+  assert_eq "still exits 0" "$?" "0"
+
+  # A profile.env that does not pin gcloud is also no opinion.
+  seed_profile_env work 'export CS_TEST_ONE=one'
+  out="$(cs doctor 2>&1)"
+  assert_not_contains "silent without CLOUDSDK_CONFIG" "$out" "gcloud"
+
+  # Pinned, but never logged in.
+  seed_gcloud_env work
+  out="$(cs doctor 2>&1)"
+  assert_contains "reports no account" "$out" "gcloud: NO ACCOUNT"
+  cs doctor >/dev/null 2>&1
+  assert_eq "no account exits 1" "$?" "1"
+
+  # Logged in, but the application default credentials were never written.
+  printf 'work@corp.com\n' >"$HOME/.gcloud-accounts"
+  out="$(cs doctor 2>&1)"
+  assert_contains "reports the account" "$out" "gcloud: work@corp.com"
+  assert_contains "names the missing project" "$out" "(no project set)"
+  printf 'my-project\n' >"$HOME/.gcloud-project"
+  out="$(cs doctor 2>&1)"
+  assert_contains "reports the project when set" "$out" "gcloud: work@corp.com (my-project)"
+  rm -f "$HOME/.gcloud-project"
+  out="$(cs doctor 2>&1)"
+  assert_contains "reports the missing ADC file" "$out" "NO application default credentials"
+  cs doctor >/dev/null 2>&1
+  assert_eq "missing ADC exits 1" "$?" "1"
+
+  # Both credentials present -> healthy and quiet.
+  mkdir -p "$HOME/.config/gcloud-profiles/work"
+  printf '{}\n' >"$HOME/.config/gcloud-profiles/work/application_default_credentials.json"
+  out="$(cs doctor 2>&1)"
+  assert_not_contains "healthy says nothing about ADC" "$out" "NO application default"
+  cs doctor >/dev/null 2>&1
+  assert_eq "healthy exits 0" "$?" "0"
+
+  # Two accounts in one profile is the leak this feature exists to catch.
+  printf 'work@corp.com\npersonal@example.com\n' >"$HOME/.gcloud-accounts"
+  out="$(cs doctor 2>&1)"
+  assert_contains "flags two accounts" "$out" "gcloud: 2 ACCOUNTS in one profile"
+  assert_contains "names the leaked account" "$out" "personal@example.com"
+  cs doctor >/dev/null 2>&1
+  assert_eq "two accounts exits 1" "$?" "1"
+  teardown
+}
+
 t_validate_name
 t_help
 t_sha256_matches_claude_scheme
@@ -869,6 +1867,27 @@ t_resource_preserves_profile
 t_rm
 t_rm_legacy_credentials
 t_rm_pinned_clears_env
+t_profile_env_applied_on_use
+t_profile_env_swapped_between_profiles
+t_profile_env_cleared_on_off_and_rm
+t_profile_env_tracks_despite_failing_last_line
+t_profile_env_refuses_blocked_names
+t_profile_env_pin_survives_bare_assignment
+t_profile_env_use_reports_failure_status
+t_profile_env_symlink_permissions_checked
+t_profile_env_refuses_writable_directory
+t_profile_env_clear_ignores_blocked_names
+t_profile_env_tracks_multiple_exports_per_line
+t_profile_env_quoted_multi_cannot_smuggle_blocked_name
+t_profile_env_survives_hostile_ifs
+t_profile_env_bare_path_assignment_restored
+t_profile_env_tracking_survives_self_unset
+t_profile_env_symlink_target_directory_checked
+t_profile_env_run_clears_caller_env
+t_profile_env_refuses_world_writable
+t_profile_env_reaches_run_without_pinning
+t_env_subcommand
+t_list_marks_env_profiles
 t_doctor_healthy_and_duplicate
 t_doctor_default_duplicate
 t_doctor_not_logged_in
@@ -886,6 +1905,25 @@ t_credential_missing_is_reported
 t_login_abort_cleans_up
 t_rm_reports_exact_leftover_service
 t_installer
+t_login_provider_grammar
+t_login_gcloud_provider
+t_login_gcloud_does_not_pin_the_shell
+t_doctor_gcloud_checks
+t_gcloud_ignores_inherited_config
+t_env_parser_ignores_comments
+t_rm_guard_normalizes_paths
+t_provider_output_is_not_mixed_with_profile_env_output
+t_gcloud_refuses_an_unsafe_credential_directory
+t_rm_warns_when_it_cannot_read_provider_paths
+t_env_trailing_conditional_still_applies
+t_env_tracking_survives_a_custom_ifs
+t_gcloud_usage_error_is_not_a_broken_env_file
+t_rm_removes_provider_credentials
+t_rm_refuses_a_shared_directory
+t_gcloud_ignores_inherited_adc_path
+t_gcloud_adc_outside_the_config_dir
+t_gcloud_unusable_env_file
+t_gcloud_args_reach_both_logins
 
 #------------------------------------------------------------------- summary
 

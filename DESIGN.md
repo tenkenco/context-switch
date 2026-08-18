@@ -6,12 +6,16 @@ This document explains the reasoning behind the implementation: what we tried, w
 ## Goal
 
 I had enough of switching accounts whenever my Claude limit was reached.
-The goal of `claude-switch` is to make concurrent account switching a touch
+The goal of `context-switch` is to make concurrent account switching a touch
 more bearable than logging into different MFA-enabled Google accounts
 manually.
 
 The goal is to make sure there's no silent identity drift, no background
 daemons to babysit, and no brittle interception layer.
+
+The same problem turned out to be general. Claude Code is one tool among many
+that keeps its identity in a global file. So the tool now pins other CLIs too.
+See [Generalizing past Claude Code](#generalizing-past-claude-code) below.
 
 ## Where identity state actually lives
 
@@ -97,6 +101,301 @@ The fix is a usage rule, not code: **one account, one profile; always `cs use`
 before `claude`.** `cs doctor` enforces it by reporting the account behind every
 namespace (including the default) and failing if any account appears twice.
 
+## Generalizing past Claude Code
+
+Claude Code is not special here. Most CLI tools read their config path from an
+environment variable, and store the active identity in one global file. The
+environment variable is the escape hatch, because environment variables are per
+process and children inherit them.
+
+gcloud is the sharpest example, and the reason this feature exists:
+
+- `~/.config/gcloud/active_config` names the active configuration. It is one
+  file for every shell, so `gcloud config configurations activate` and
+  `gcloud auth login` switch every terminal at once. Named configurations do
+  not help, because activation itself is global.
+- `~/.config/gcloud/application_default_credentials.json` holds the application
+  default credentials. `gcloud auth application-default login` overwrites it
+  with the newest account. The Terraform google provider reads that file, so a
+  login for one account breaks Terraform runs for the other.
+
+`CLOUDSDK_CONFIG` moves both files into a per-profile directory, which removes
+the shared state entirely.
+
+### Why `profile.env` sets two variables for gcloud
+
+The recommended `profile.env` sets `CLOUDSDK_CONFIG` **and**
+`GOOGLE_APPLICATION_CREDENTIALS`. The gcloud CLI honors the first. Whether Go's
+application-default lookup honors it depends on the version of
+`golang.org/x/oauth2/google` compiled into the tool, and the Terraform google
+provider is Go. Every Google auth library honors
+`GOOGLE_APPLICATION_CREDENTIALS` unconditionally. Setting both makes the
+uncertain fact irrelevant.
+
+### Why the application default credentials file must exist
+
+`GOOGLE_APPLICATION_CREDENTIALS` is an explicit path, not a hint. A Google auth
+library that reads it, and finds no file there, raises an error. It does not
+fall back to `~/.config/gcloud`, and it does not fall back to the credential
+that `gcloud auth login` saved.
+
+That makes the two gcloud login commands both required per profile.
+`gcloud auth login` saves the credential for the `gcloud` command.
+`gcloud auth application-default login` writes
+`$CLOUDSDK_CONFIG/application_default_credentials.json`, which is the path the
+variable names. A profile with only the first login looks healthy under
+`gcloud auth list`, and still breaks Terraform.
+
+### Why the shared gcloud directory still matters
+
+`CLOUDSDK_CONFIG` removes the shared state for pinned shells only. A shell with
+no pin keeps reading `~/.config/gcloud`, which holds one account list and one
+active account for every unpinned shell. Accounts logged in there before the
+profiles existed stay there.
+
+This is the same failure as the Claude one: an identity that lives in two
+places. The fix is the same rule, applied to a second tool. Pin the shell, then
+run the tool. `cs` cannot enforce it, because `gcloud` is not a command that
+`cs` wraps.
+
+### Why a data file and not per-tool code
+
+A `profile.env` file makes adding a tool a data change, not a code change. The
+repository stays one small zsh file. Pinning a tool still needs no code at all.
+
+Login and health checks did eventually need code, which is what providers are.
+They live in `cs.zsh` rather than a `providers/*.zsh` directory. `cs.zsh` is
+sourced directly — by an absolute path from `.zshrc`, and by plugin managers
+from their own clone — so a sibling directory adds a path to resolve and breaks
+whenever someone copies the single file. Providers are found by function name
+instead, which costs nothing and lets a user add one from `.zshrc`. Extraction
+into files stays possible if the file ever grows too large.
+
+### Why the provider is an argument of `cs login`
+
+Two operations write identity, and they hold different state. `gcloud auth
+login` writes a credential to disk, which every later shell reads. `cs use`
+writes one shell's environment, which dies with that shell.
+
+The two do not commute. `gcloud auth login` before `cs use work` writes the
+credential to the shared `~/.config/gcloud` directory. `cs use work` before
+`gcloud auth login` writes it to the profile. The final state differs, and the
+wrong one is silent: `gcloud auth list` in the profile still looks correct,
+because the leaked credential sits somewhere else.
+
+No code can repair that ordering. The login command needs a target directory at
+the moment it runs, and an unpinned shell names the shared one. Nothing records
+which profile the user meant.
+
+Naming the profile in the login command removes the ordering instead of
+repairing it. `cs login work gcloud` is one operation, so there is no second
+operation to reorder. That is the same shape `cs login` already had for Claude
+Code, and the same shape as `cs run`: the profile is an argument, and the
+caller's shell is never pinned.
+
+The pin stays for daily work, where it earns its place. One `cs use work`
+points every tool in that terminal at the same identity.
+
+### Why a provider reads only what the profile pinned
+
+A provider hook runs in a subshell with the profile's `profile.env` applied.
+That is not enough on its own. `cs` clears the names a `profile.env` tracked,
+and a `CLOUDSDK_CONFIG` exported by the user's `.zshrc` was never tracked, so it
+survives into the subshell.
+
+A hook that trusted a set variable would then write the profile's credential
+into whatever global directory that `.zshrc` named, print the profile's name,
+and report success. `cs doctor` had the mirror-image bug: it reported the shared
+directory's accounts under a profile that pinned nothing, and told the user to
+revoke them from a directory `cs use` never points at.
+
+So a hook asks `_cs_profile_pins CLOUDSDK_CONFIG` instead of testing whether the
+variable is set. `_cs_load_profile_env` records the file's own names in
+`_CS_PROFILE_ENV_VARS`, and `_cs_clear_profile_env` unsets that list first, so
+inside the subshell it names this profile's exports and nothing else.
+
+The rule reads as one sentence: being set is not the same as being pinned.
+
+### Why a load failure is a flag, not an exit status
+
+`_cs_with_profile_env` must tell its caller two different things: what the
+command returned, and whether the `profile.env` loaded at all. One exit status
+cannot carry both, because the command owns the whole range. gcloud uses
+argparse, which exits 2 on a usage error, so `cs login work gcloud
+--bogus-flag` returned 2 and cs blamed a `profile.env` that was fine.
+
+The subshell writes a marker file after the load succeeds. The parent reads the
+marker into `_cs_env_load_ok` and passes the command's own status through
+untouched. A caller reads the flag; the status stays the tool's.
+
+### Why `cs rm` asks providers for paths
+
+`cs login <name> gcloud` writes an OAuth refresh token into the profile's
+`CLOUDSDK_CONFIG` directory, which sits outside the profile directory. Deleting
+the profile alone left that token on disk, and took `profile.env` — the only
+record of where the directory was — with it. The same function already deletes
+legacy plaintext credentials for exactly this reason.
+
+A provider prints the directories it owns; `cs rm` deletes them. The split is
+deliberate. Providers are the extension point, including hooks a user writes,
+and a path comes from a file the user edits. Keeping every delete in `cs rm`
+keeps the guards in one place: it refuses a path that is not absolute, that
+contains `..`, that is the home directory or an ancestor of it, that is a shared
+configuration directory such as `~/.config/gcloud`, or that is the profiles
+root. It names every path in the confirmation prompt before anything is deleted.
+
+### Why a hook owns standard output alone
+
+`_cs_with_profile_env` sources `profile.env` and then runs a hook in the same
+subshell. Both wrote to the same standard output, and `cs rm` reads a hook's
+standard output as a list of directories to delete.
+
+So a `profile.env` containing an ordinary `echo "$HOME/Documents"` put a real
+directory on the delete list, and the confirmation prompt described it as a
+credential. A `mkdir -pv`, a sourced helper, or a shell banner does the same.
+The file does not have to be hostile.
+
+The load now runs with its output redirected to standard error. The user still
+sees every line the file prints. A hook owns standard output alone, so the two
+can never be confused. The same fix stops a `profile.env` from writing a forged
+line into a `cs doctor` report.
+
+### Why the delete guard is containment, not a denylist
+
+A denylist can only refuse the paths someone thought of. The first version
+listed five, so it approved `~/.ssh`, `~/.aws`, and `/etc` for `rm -rf`.
+
+The guard now requires the path to sit under the home directory, at least two
+levels down, to be owned by the user, and to be writable by nobody else. A
+per-profile directory looks like `~/.config/gcloud-profiles/work`, which passes.
+A typo such as `~/.aws` sits one level down, which fails.
+
+It also refuses a symlink. The guard compares resolved paths, so without that
+rule a symlink planted in place of the directory would resolve to its target,
+and the target is what `rm -rf` would take. Only the final component is tested,
+because an ancestor symlink is ordinary: `/var` resolves to `/private/var` on
+macOS.
+
+The checks run twice, once when the list is built and once immediately before
+each delete. The confirmation prompt between them is an unbounded window, and
+this is an `rm -rf`.
+
+### Why check hooks have three results
+
+A provider check returns 0 for healthy, 1 for a real problem, and 2 for no
+opinion. `_cs_profile_has_credential` already used that convention, for the
+same reason: claiming a profile is broken on a guess is worse than staying
+quiet.
+
+Result 2 carries the weight here. Most profiles pin some tools and not others.
+A profile with no `profile.env`, or one that never exports `CLOUDSDK_CONFIG`,
+must produce no gcloud output at all. Without that rule `cs doctor` would report
+a missing gcloud login for every profile that never wanted one, and the report
+people actually need would drown.
+
+### What the tracking contract buys
+
+`cs` parses `export VAR=value` lines and records those names in
+`_CS_PROFILE_ENV_VARS` at load time. It then unsets exactly those names on
+`cs off`, and before applying a different profile.
+
+Clearing before `cs use` applies the next profile is the important case. Without
+it, `cs use work` after `cs use personal` would leave personal's
+`CLOUDSDK_CONFIG` in a shell that claims to be work. That is the identity drift
+this tool exists to prevent. `cs run` clears the caller's env for the same
+reason, inside its subshell, before it loads the target profile.
+
+Recording at load time is deliberate. Re-reading the file at unload time would
+strand variables whenever the file changed or was deleted in between.
+
+Recording happens *before* the file is sourced, which is subtler and matters
+more. `source` returns the exit status of the file's last command. An ordinary
+trailing line such as
+
+```sh
+[[ -d "$HOME/work-tools" ]] && export EXTRA=1
+```
+
+returns non-zero whenever that test fails — with every earlier export already
+applied. An implementation that recorded the names after a successful `source`
+would skip the record on exactly that file, and leave those variables set and
+untracked forever. An ordering mistake would reintroduce the same drift.
+
+### The refused-names list
+
+`cs` rejects a `profile.env` outright when it exports `PATH`, `HOME`, `IFS`,
+`PWD`, `OLDPWD`, `SHELL`, `TMPDIR`, `CLAUDE_CONFIG_DIR`, `_CS_PROFILE`, or
+`_CS_PROFILE_ENV_VARS`.
+
+The reason is the clearing rule above. `cs off` unsets every tracked name, so
+tracking `PATH` would leave a shell that cannot run a single command. The last
+three name the pin, so a file that sets them could make `cs use` report one
+profile while `claude` launches as another.
+
+Rejecting the whole file beats ignoring one line. A partly applied file leaves
+the user with an identity they did not ask for and no error to explain it.
+
+The same rule decides what to do with an ambiguous line. A quoted value can
+contain spaces, and even a `WORD=` that is not a variable, so
+`export K="a B=2"` and `export K="a" B=2` cannot be told apart without
+implementing shell quoting. An early version kept the first name and moved on.
+That was a security hole rather than a rough edge: `export OK="yes"
+PATH="/nowhere"` hid `PATH` from the check above, sourced the file, and left an
+interactive shell that could not run a single command. `cs` now refuses a
+quoted line that carries more than one candidate.
+
+### Bare assignments, and why cs restores five variables
+
+The refused-names check reads `export` lines. A bare `PATH=/nowhere` or
+`IFS=,` never reaches it, and still changes the shell, because those variables
+are already exported. A poisoned `IFS` is the worst of them. It silently breaks
+every word split that follows, including the one `cs off` performs on its own
+record, which strands every tracked variable.
+
+So `cs` snapshots `PATH`, `IFS`, `HOME`, `SHELL`, and `TMPDIR` before sourcing,
+restores any the file moved, and names them. This is the same idea as the pin
+re-assert: `cs` cannot contain arbitrary code, but it can put back the few
+values it knows must not change.
+
+`cs use` also re-asserts `CLAUDE_CONFIG_DIR` and `_CS_PROFILE` after sourcing.
+The refused-names check reads `export` lines, but the file is sourced, so a bare
+`CLAUDE_CONFIG_DIR=...` assignment still updates the already-exported variable.
+Arbitrary code in a sourced file cannot be fully contained; re-asserting the two
+values cs actually knows is cheap and closes the case that matters.
+
+### Why profiles stay under `~/.claude/profiles`
+
+The path is now a misnomer, and it stays anyway. Claude Code names each keychain
+entry after `sha256(CLAUDE_CONFIG_DIR)`. Moving the profiles directory changes
+every hash, orphans every stored credential, and forces a re-login for every
+profile. The cosmetic gain is not worth that.
+
+### Sourcing is running code
+
+`cs use` sources `profile.env`, so the file executes with your shell's
+privileges. `cs` refuses to source it unless you own it and only you can write
+it.
+
+`cs` applies the same check to the profile directory. Checking the file alone
+is not enough: anyone who can write the directory can delete `profile.env` and
+drop in their own `0600` copy, which then passes every check on the file. Both
+checks follow symlinks, because a symlink's own mode is `0777` on Linux and
+`0755` on macOS and says nothing about its target.
+
+`cs login` creates the profile directory `0700`, so this holds by default. The
+check exists for the cases that come later: a permissive umask, a restored
+backup, a synced home directory, or a stray `chmod -R`.
+
+`cs` does not sandbox the file's contents. A file in your own home directory
+offers no meaningful boundary to sandbox against. Keep the file to plain
+exports.
+
+`cs off` also refuses to unset a protected name, even when
+`_CS_PROFILE_ENV_VARS` names one. That variable is exported, so it can reach a
+shell from a parent process or a stale session rather than from a file `cs`
+parsed. `cs` never writes a protected name into it, so one appearing there did
+not come from `cs`.
+
 ## Out of scope
 
 - local HTTP proxy for refresh interception
@@ -130,4 +429,4 @@ CLAUDE_CONFIG_DIR="$HOME/.claude/profiles/work"     claude auth status --json
 ```
 
 If the suffix no longer matches, or two config dirs collapse to one account,
-`claude-switch` (and `cs doctor`) may need an update.
+`context-switch` (and `cs doctor`) may need an update.
