@@ -157,7 +157,7 @@ SH
     _cs_profile_env_file _cs_parse_env_vars _cs_clear_profile_env \
     _cs_load_profile_env _cs_env _cs_env_find_blocked _cs_env_path_unsafe \
     _cs_source_diagnostics _cs_login _cs_login_cleanup _cs_use _cs_run _cs_off \
-    _cs_list _cs_current _cs_rm _cs_doctor _cs_help \
+    _cs_list _cs_current _cs_rm _cs_doctor _cs_help __cs_restore \
     _cs_validate_provider _cs_provider_list _cs_with_profile_env _cs_profile_pins _cs_export_env_var_names _cs_rm_path_unsafe \
     _cs_provider_gcloud_paths _cs_gcloud_paths_here \
     _cs_provider_claude_login _cs_provider_gcloud_login _cs_provider_gcloud_check \
@@ -1315,7 +1315,8 @@ t_snapshot_shell_wrapper_launches() {
   assert_not_contains "helpers really are stripped" "$out" "HELPERS_PRESENT"
   assert_not_contains "no command-not-found" "$out" "command not found"
   assert_not_contains "does not refuse to launch" "$out" "refusing to launch"
-  assert_contains "announces profile (name-only banner)" "$out" "launching claude as 'personal'"
+  assert_contains "announces profile" "$out" "launching claude as 'personal'"
+  assert_contains "and still resolves the email" "$out" "personal@example.com"
   assert_contains "args passed through" "$out" "FAKE_CLAUDE: go"
   assert_contains "config dir aligned to pin" "$out" "CFG=$HOME/.claude/profiles/personal"
   teardown
@@ -1415,35 +1416,39 @@ t_snapshot_shell_provider_commands_self_heal() {
   teardown
 }
 
-t_snapshot_shell_cs_reports_a_missing_self() {
-  echo "[snapshot shell: cs says so when it cannot restore itself]"
+t_snapshot_shell_reports_a_missing_self() {
+  echo "[snapshot shell: cs and claude say so when they cannot restore]"
   setup
-  # _CS_SELF is how cs finds its own file. Without it the dispatcher must give
-  # an actionable message, not a bare "command not found".
+  seed_profile personal personal@example.com
+  # _CS_SELF is how the recovery finds this file. Without it both entry points
+  # must give an actionable message, not a bare "command not found".
   local out
-  out="$(zsh -c 'source "$1"
-    for __f in ${(k)functions}; do
-      [[ "$__f" == _[^_]* ]] && unfunction "$__f" 2>/dev/null
-    done
-    _CS_SELF=/nonexistent/cs.zsh
-    cs list' zsh "$CS_ZSH" 2>&1)"
-  assert_contains "explains the problem" "$out" "helper functions are missing"
-  assert_contains "says what to do" "$out" "Re-source cs.zsh and retry"
+  for cmd in "cs list" "claude go"; do
+    out="$(zsh -c 'source "$1"
+      for __f in ${(k)functions}; do
+        [[ "$__f" == _[^_]* ]] && unfunction "$__f" 2>/dev/null
+      done
+      _CS_SELF=/nonexistent/cs.zsh
+      _CS_PROFILE=personal
+      eval "$2"' zsh "$CS_ZSH" "$cmd" 2>&1)"
+    assert_contains "$cmd explains the problem" "$out" "helper functions are missing"
+    assert_contains "$cmd says what to do" "$out" "Re-source cs.zsh and retry"
+    assert_not_contains "$cmd does not launch anyway" "$out" "FAKE_CLAUDE"
+  done
   teardown
 }
 
-t_wrapper_auth_var_list_stays_in_sync() {
-  echo "[wrapper: inlined scrub list matches _CS_AUTH_OVERRIDE_VARS]"
+t_restore_helper_survives_the_snapshot_filter() {
+  echo "[snapshot shell: the recovery helper is itself kept]"
   setup
-  # The wrapper must inline this list (it cannot call _cs_build_scrub_args in a
-  # snapshot shell), so the two copies can silently drift — and a var dropped
-  # from the inlined copy leaks that credential into the launched claude. Pin
-  # them together so adding one to the array without the other fails here.
-  local canonical inline
-  canonical="$(print -l "${_CS_AUTH_OVERRIDE_VARS[@]}" | sort -u | tr '\n' ' ')"
-  inline="$(sed -n '/for v in CLAUDE_CODE_OAUTH_TOKEN/,/; do$/p' "$CS_ZSH" |
-    grep -oE '[A-Z][A-Z0-9_]+' | sort -u | tr '\n' ' ')"
-  assert_eq "inlined scrub list == _CS_AUTH_OVERRIDE_VARS" "$inline" "$canonical"
+  # The double underscore is what makes one recovery path possible instead of
+  # two inlined copies. If the filter ever drops __ names too, this fails first
+  # and explains why everything else broke.
+  local out
+  out="$(run_in_snapshot_shell 'typeset -f __cs_restore >/dev/null && print KEPT || print DROPPED')"
+  assert_contains "__cs_restore survives" "$out" "KEPT"
+  out="$(run_in_snapshot_shell 'typeset -f _cs_validate_name >/dev/null && print KEPT || print DROPPED')"
+  assert_contains "_cs_* helpers do not" "$out" "DROPPED"
   teardown
 }
 
@@ -2083,8 +2088,8 @@ t_snapshot_shell_wrapper_refuses_bad_profile
 t_snapshot_shell_wrapper_unpinned_passthrough
 t_snapshot_shell_cs_self_heals
 t_snapshot_shell_provider_commands_self_heal
-t_snapshot_shell_cs_reports_a_missing_self
-t_wrapper_auth_var_list_stays_in_sync
+t_snapshot_shell_reports_a_missing_self
+t_restore_helper_survives_the_snapshot_filter
 t_login_provider_grammar
 t_login_gcloud_provider
 t_login_gcloud_does_not_pin_the_shell

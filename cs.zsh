@@ -76,6 +76,26 @@
 # the file and says so.
 typeset -g _CS_SELF="${0:A}"
 
+# Restore the _cs_* helpers if this shell lost them, and report whether they are
+# usable. Returns 0 when the helpers are available, 1 when they are not.
+#
+# The DOUBLE underscore is load-bearing. A shell rebuilt from a snapshot keeps
+# public names and __double_underscore names, and drops _single_underscore ones
+# — zsh's convention for completion functions. So this function survives where
+# every _cs_* helper does not, which is what lets `cs` and the `claude` wrapper
+# share one recovery path instead of each inlining its own copy of the helpers.
+__cs_restore() {
+  typeset -f _cs_validate_name >/dev/null && return 0
+  if [[ -r "${_CS_SELF:-}" ]]; then
+    # shellcheck disable=SC1090 # path is this very file, resolved at source time
+    source "$_CS_SELF"
+    typeset -f _cs_validate_name >/dev/null && return 0
+  fi
+  echo "cs: helper functions are missing from this shell and cs.zsh could not" >&2
+  echo "    be located to restore them. Re-source cs.zsh and retry." >&2
+  return 1
+}
+
 typeset -g _CS_FOREIGN_CLAUDE=""
 if typeset -f claude >/dev/null 2>&1; then
   if [[ "$(typeset -f claude)" == *"_CS_CLAUDE_SWITCH_WRAPPER"* ]]; then
@@ -1729,21 +1749,11 @@ cs() {
   # invokes, and restores on return.
   emulate -L zsh
 
-  # Self-heal: tools that reconstruct a shell from a snapshot can restore this
-  # dispatcher while dropping the _cs_* helpers it delegates to (see the note
-  # above the `claude` wrapper). Re-source ourselves rather than failing with a
-  # bare "command not found: _cs_login". Every provider function is a _cs_* name
-  # too, so without this `cs doctor` and `cs login <p> gcloud` die the same way.
-  if ! typeset -f _cs_help >/dev/null; then
-    if [[ -r "${_CS_SELF:-}" ]]; then
-      # shellcheck disable=SC1090 # path is this very file, resolved at source time
-      source "$_CS_SELF"
-    else
-      echo "cs: helper functions are missing from this shell and cs.zsh could not" >&2
-      echo "    be located to restore them. Re-source cs.zsh and retry." >&2
-      return 1
-    fi
-  fi
+  # A shell rebuilt from a snapshot keeps this dispatcher and drops every _cs_*
+  # helper it delegates to. Recover rather than failing with a bare "command not
+  # found: _cs_login". Every provider function is a _cs_* name too, so without
+  # this `cs doctor` and `cs login <p> gcloud` die the same way.
+  __cs_restore || return 1
 
   # Keychain probes are memoized per invocation, not per shell: a login or
   # removal between two `cs` calls must not be masked by a stale answer.
@@ -1779,54 +1789,35 @@ claude() {
   # Function-body sentinel used at source time to distinguish this wrapper from
   # a function restored or installed later by the user or another plugin.
   : _CS_CLAUDE_SWITCH_WRAPPER
+  # Same recovery as `cs`: a snapshot shell keeps this wrapper and drops every
+  # _cs_* helper it calls. Without this the wrapper called _cs_validate_name,
+  # got 127, read that as "invalid profile name" and refused to launch.
+  __cs_restore || return 1
   [[ -n "${_CS_PROFILE:-}" ]] || {
     # Unpinned: pass through untouched (the user may intentionally be using an
     # API key or the default login here).
     command claude "$@"
     return
   }
-  # Inline name validation — mirrors _cs_validate_name.
-  if [[ ! "$_CS_PROFILE" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ || "$_CS_PROFILE" == *..* ]]; then
+  if ! _cs_validate_name "$_CS_PROFILE"; then
     echo "cs: refusing to launch — _CS_PROFILE='$_CS_PROFILE' is not a valid profile name" >&2
     return 1
   fi
   # Keep the exported config dir consistent with the pin (defends against a
-  # shell where _CS_PROFILE and CLAUDE_CONFIG_DIR drifted apart). Inline —
-  # mirrors _cs_profile_config_dir and _cs_profiles_root.
-  export CLAUDE_CONFIG_DIR="$HOME/.claude/profiles/$_CS_PROFILE"
-  # The account email is cosmetic, so degrade to a name-only banner when the
-  # helper is unavailable rather than failing the launch.
-  if typeset -f _cs_profile_email >/dev/null; then
-    echo "cs: launching claude as '$_CS_PROFILE' ($(_cs_profile_email "$_CS_PROFILE"))" >&2
-  else
-    echo "cs: launching claude as '$_CS_PROFILE'" >&2
-  fi
+  # shell where _CS_PROFILE and CLAUDE_CONFIG_DIR drifted apart).
+  local cfg_dir
+  cfg_dir="$(_cs_profile_config_dir "$_CS_PROFILE")"
+  export CLAUDE_CONFIG_DIR="$cfg_dir"
+  echo "cs: launching claude as '$_CS_PROFILE' ($(_cs_profile_email "$_CS_PROFILE"))" >&2
   # Launch with every overriding auth var stripped, so the IDENTITY comes only
   # from the profile's keychain slot — not a stray ANTHROPIC_API_KEY / OAuth
   # token / custom headers / Bedrock / Vertex setting. This does not control
   # where the request goes: ANTHROPIC_BASE_URL is deliberately left intact
   # (see _CS_AUTH_NOTE_VARS), hence the warning. `env … claude` runs the real
   # binary directly, which also avoids re-entering this wrapper.
-  # Inline, not delegated: this warning must survive a snapshot shell too. The
-  # scrub controls WHICH IDENTITY is used, not WHERE the request goes, so a
-  # BASE_URL pointing somewhere unexpected still receives this profile's token.
-  if [[ -n "${ANTHROPIC_BASE_URL:-}" ]]; then
-    echo "cs: note — ANTHROPIC_BASE_URL is set; this profile's token is sent to" >&2
-    echo "    $ANTHROPIC_BASE_URL, not the default API endpoint (cs does not strip it)." >&2
-  fi
-  # Inline scrub list. It MIRRORS _CS_AUTH_OVERRIDE_VARS and a test pins the two
-  # together, so dropping a name from either copy fails the suite. Scrubbing has
-  # to work in a snapshot shell as well: a plain pass-through would let a stray
-  # ANTHROPIC_API_KEY authenticate and bill the wrong identity, which is the
-  # exact failure the scrub exists to prevent.
-  local -a scrub
-  local v
-  for v in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN \
-    ANTHROPIC_CUSTOM_HEADERS AWS_BEARER_TOKEN_BEDROCK CLAUDE_CODE_USE_BEDROCK \
-    CLAUDE_CODE_USE_VERTEX; do
-    scrub+=(-u "$v")
-  done
-  env "${scrub[@]}" claude "$@"
+  _cs_warn_note_vars
+  _cs_build_scrub_args
+  env "${_cs_scrub[@]}" claude "$@"
 }
 
 #==============================================================================
