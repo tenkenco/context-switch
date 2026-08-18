@@ -69,11 +69,12 @@
 # error there.
 # Absolute path to this file, recorded at source time so `cs` can re-source
 # itself if it is ever restored into a shell without its helpers (see the note
-# above the `claude` wrapper). %x names the file being sourced; :A absolutizes
-# it. Must stay at the top level of this file: inside a function or an `if`, %x
-# no longer names cs.zsh, and the self-heal loses the only path it can use.
-# shellcheck disable=SC2296,SC2298 # zsh prompt expansion; shellcheck parses sh
-typeset -g _CS_SELF="${${(%):-%x}:A}"
+# above the `claude` wrapper). In zsh, $0 inside a sourced file names that file;
+# the plugin shims already rely on it to find this one. Must stay at the top
+# level: inside a function $0 names the function instead, and the self-heal
+# loses the only path it can use. A wrong value fails safe — `cs` cannot read
+# the file and says so.
+typeset -g _CS_SELF="${0:A}"
 
 typeset -g _CS_FOREIGN_CLAUDE=""
 if typeset -f claude >/dev/null 2>&1; then
