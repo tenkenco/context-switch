@@ -421,6 +421,7 @@ export CS_QUIET=1
 - ⚠️ A profile carried over from that era can look logged in (`cs list` shows an email) while having no stored credential, because the old `claude` wrapper wrote that email into the config cosmetically. `cs list` and `cs use` now say `no credential` when that is the case — run `cs login <name>` to fix it.
 - 🔁 Two *concurrent* sessions of the **same** profile share one credential slot; heavy parallel use of one account can still rotate against itself.
 - 🧩 This tool depends on Claude Code internals, so future Claude releases may require updates. Re-check with `cs doctor` after upgrades.
+- 🧵 `claude` and `cs` also work in a shell rebuilt from a snapshot, such as the one Claude Code sources for every Bash tool call. That shell drops every `_cs_*` helper, so the `claude` wrapper calls none of them, and `cs` re-sources itself when it finds them missing.
 
 ## Tests
 

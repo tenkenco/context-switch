@@ -67,6 +67,35 @@
 # zsh's ${+functions[...]} / $functions[...] forms: this file is also parsed by
 # shfmt and shellcheck as bash, and those flag-style expansions are a hard parse
 # error there.
+# Absolute path to this file, recorded at source time so `cs` can re-source
+# itself if it is ever restored into a shell without its helpers (see the note
+# above the `claude` wrapper). In zsh, $0 inside a sourced file names that file;
+# the plugin shims already rely on it to find this one. Must stay at the top
+# level: inside a function $0 names the function instead, and the self-heal
+# loses the only path it can use. A wrong value fails safe — `cs` cannot read
+# the file and says so.
+typeset -g _CS_SELF="${0:A}"
+
+# Restore the _cs_* helpers if this shell lost them, and report whether they are
+# usable. Returns 0 when the helpers are available, 1 when they are not.
+#
+# The DOUBLE underscore is load-bearing. A shell rebuilt from a snapshot keeps
+# public names and __double_underscore names, and drops _single_underscore ones
+# — zsh's convention for completion functions. So this function survives where
+# every _cs_* helper does not, which is what lets `cs` and the `claude` wrapper
+# share one recovery path instead of each inlining its own copy of the helpers.
+__cs_restore() {
+  typeset -f _cs_validate_name >/dev/null && return 0
+  if [[ -r "${_CS_SELF:-}" ]]; then
+    # shellcheck disable=SC1090 # path is this very file, resolved at source time
+    source "$_CS_SELF"
+    typeset -f _cs_validate_name >/dev/null && return 0
+  fi
+  echo "cs: helper functions are missing from this shell and cs.zsh could not" >&2
+  echo "    be located to restore them. Re-source cs.zsh and retry." >&2
+  return 1
+}
+
 typeset -g _CS_FOREIGN_CLAUDE=""
 if typeset -f claude >/dev/null 2>&1; then
   if [[ "$(typeset -f claude)" == *"_CS_CLAUDE_SWITCH_WRAPPER"* ]]; then
@@ -1719,6 +1748,13 @@ cs() {
   # (LOCAL_OPTIONS) resets to zsh defaults for this call and every helper it
   # invokes, and restores on return.
   emulate -L zsh
+
+  # A shell rebuilt from a snapshot keeps this dispatcher and drops every _cs_*
+  # helper it delegates to. Recover rather than failing with a bare "command not
+  # found: _cs_login". Every provider function is a _cs_* name too, so without
+  # this `cs doctor` and `cs login <p> gcloud` die the same way.
+  __cs_restore || return 1
+
   # Keychain probes are memoized per invocation, not per shell: a login or
   # removal between two `cs` calls must not be masked by a stale answer.
   _CS_KC_SCHEME_CACHE=""
@@ -1753,6 +1789,10 @@ claude() {
   # Function-body sentinel used at source time to distinguish this wrapper from
   # a function restored or installed later by the user or another plugin.
   : _CS_CLAUDE_SWITCH_WRAPPER
+  # Same recovery as `cs`: a snapshot shell keeps this wrapper and drops every
+  # _cs_* helper it calls. Without this the wrapper called _cs_validate_name,
+  # got 127, read that as "invalid profile name" and refused to launch.
+  __cs_restore || return 1
   [[ -n "${_CS_PROFILE:-}" ]] || {
     # Unpinned: pass through untouched (the user may intentionally be using an
     # API key or the default login here).

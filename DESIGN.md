@@ -396,6 +396,41 @@ shell from a parent process or a stale session rather than from a file `cs`
 parsed. `cs` never writes a protected name into it, so one appearing there did
 not come from `cs`.
 
+### Why the `claude` wrapper calls no helper
+
+Tools that reconstruct a shell from a snapshot restore the public `cs` and
+`claude` functions and drop every single-underscore-prefixed one, because that
+is zsh's convention for completion functions. Double-underscore names such as
+`__nvm` survive; `_cs_*` names do not.
+
+Claude Code writes such a snapshot and sources it for every Bash tool call. The
+wrapper called `_cs_validate_name`, got status 127, read that as "invalid
+profile name", and refused to launch. `claude` was therefore unusable from
+Claude Code's own Bash tool, from subagents, and from scripts. `cs` was equally
+dead.
+
+So `claude()` is self-contained. Name validation, the config directory, the
+base-url notice, and the auth scrub are all inlined.
+
+The scrub is inlined rather than skipped. A pass-through in the degraded path
+would let a stray `ANTHROPIC_API_KEY` authenticate and bill the wrong identity,
+which is the exact failure the scrub exists to prevent. That inline list
+duplicates `_CS_AUTH_OVERRIDE_VARS`, so a test pins the two together: dropping a
+name from either copy fails the suite.
+
+Only the account email degrades. It is cosmetic, so the banner loses the email
+rather than the launch failing.
+
+`cs()` takes the other approach and re-sources itself from `_CS_SELF`, recorded
+at source time. A dispatcher may re-source; a wrapper that launches a process
+should not. Providers made this matter more, not less: every provider function
+is a `_cs_*` name, so `cs doctor` and `cs login <profile> gcloud` were dead in
+the same shells.
+
+`_CS_SELF` must stay at the top level of `cs.zsh`. Inside a function or an `if`,
+the `%x` prompt expansion no longer names the file, and the self-heal loses the
+only path it can use.
+
 ## Out of scope
 
 - local HTTP proxy for refresh interception

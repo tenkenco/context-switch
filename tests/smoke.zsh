@@ -157,7 +157,7 @@ SH
     _cs_profile_env_file _cs_parse_env_vars _cs_clear_profile_env \
     _cs_load_profile_env _cs_env _cs_env_find_blocked _cs_env_path_unsafe \
     _cs_source_diagnostics _cs_login _cs_login_cleanup _cs_use _cs_run _cs_off \
-    _cs_list _cs_current _cs_rm _cs_doctor _cs_help \
+    _cs_list _cs_current _cs_rm _cs_doctor _cs_help __cs_restore \
     _cs_validate_provider _cs_provider_list _cs_with_profile_env _cs_profile_pins _cs_export_env_var_names _cs_rm_path_unsafe \
     _cs_provider_gcloud_paths _cs_gcloud_paths_here \
     _cs_provider_claude_login _cs_provider_gcloud_login _cs_provider_gcloud_check \
@@ -240,6 +240,23 @@ seed_legacy_files() {
   printf 'sk-ant-oat01-FAKE\n' >"$dir/$name.token"
   printf '{"emailAddress":"%s@example.com"}\n' "$name" >"$dir/$name.account.json"
   printf '{"claudeAiOauth":{"accessToken":"FAKE","refreshToken":"FAKE"}}\n' >"$dir/$name.json"
+}
+
+# Run <code> in a child zsh that has sourced cs.zsh and then dropped every
+# single-underscore-prefixed function — reproducing what a reconstructed shell
+# snapshot does. Claude Code writes one to ~/.claude/**/shell-snapshots/*.sh and
+# sources it for every Bash tool call; it keeps the public `cs`/`claude` (and
+# __double_underscore names) but filters _foo, zsh's convention for completion
+# functions. That silently removed every _cs_* helper.
+#
+# Deliberately a CHILD PROCESS: stripping in-process would also delete this
+# harness's own _pass/_fail helpers and take the suite down with it.
+run_in_snapshot_shell() {
+  zsh -c 'source "$1"
+    for __f in ${(k)functions}; do
+      [[ "$__f" == _[^_]* ]] && unfunction "$__f" 2>/dev/null
+    done
+    eval "$2"' zsh "$CS_ZSH" "$1" 2>&1
 }
 
 #------------------------------------------------------------------- tests
@@ -1276,6 +1293,185 @@ JSON
   teardown
 }
 
+#--------------------------------- snapshot-shell resilience (regression)
+# A shell rebuilt from a snapshot has `cs`/`claude` but no _cs_* helpers. The
+# wrapper used to call _cs_validate_name there, get 127, read that as "invalid
+# profile" and hard-refuse — making `claude` unusable from Claude Code's own
+# Bash tool, subagents and scripts. Providers made this worse: every provider
+# function is a _cs_* name too, so `cs doctor` and `cs login <p> gcloud` died
+# the same way. These pin the degraded path.
+
+t_snapshot_shell_wrapper_launches() {
+  echo "[snapshot shell: wrapper launches without _cs_* helpers]"
+  setup
+  seed_profile personal personal@example.com
+  local out
+  out="$(run_in_snapshot_shell '
+    typeset -f _cs_validate_name >/dev/null && print "HELPERS_PRESENT"
+    _CS_PROFILE=personal
+    claude go
+    print "CFG=$CLAUDE_CONFIG_DIR"
+  ')"
+  assert_not_contains "helpers really are stripped" "$out" "HELPERS_PRESENT"
+  assert_not_contains "no command-not-found" "$out" "command not found"
+  assert_not_contains "does not refuse to launch" "$out" "refusing to launch"
+  assert_contains "announces profile" "$out" "launching claude as 'personal'"
+  assert_contains "and still resolves the email" "$out" "personal@example.com"
+  assert_contains "args passed through" "$out" "FAKE_CLAUDE: go"
+  assert_contains "config dir aligned to pin" "$out" "CFG=$HOME/.claude/profiles/personal"
+  teardown
+}
+
+t_snapshot_shell_wrapper_scrubs_override_auth_vars() {
+  echo "[snapshot shell: wrapper still strips overriding auth vars]"
+  setup
+  seed_profile personal personal@example.com
+  # The security-critical case: a pass-through fallback would let a stray
+  # ANTHROPIC_API_KEY authenticate (and bill) the wrong identity, which is the
+  # exact thing the scrub exists to prevent. It must survive helper loss.
+  run_in_snapshot_shell '
+    export ANTHROPIC_API_KEY=sk-ant-api-LEAK
+    export CLAUDE_CODE_OAUTH_TOKEN=oat-LEAK
+    export CLAUDE_CODE_USE_BEDROCK=1
+    export CLAUDE_CODE_USE_VERTEX=1
+    _CS_PROFILE=personal
+    claude go
+  ' >/dev/null
+  assert_file_exists "fake claude was invoked" "$HOME/.claude-launch-env"
+  local launched
+  launched="$(<"$HOME/.claude-launch-env")"
+  assert_eq "launched claude saw no overriding auth vars" "$launched" "API= TOKEN= BEDROCK= VERTEX="
+  teardown
+}
+
+t_snapshot_shell_wrapper_warns_about_base_url() {
+  echo "[snapshot shell: the base-url notice survives too]"
+  setup
+  seed_profile personal personal@example.com
+  # cs deliberately does NOT strip ANTHROPIC_BASE_URL, so the profile's token
+  # still goes wherever it points. Every launch path warns; a snapshot shell is
+  # a launch path.
+  local out
+  out="$(run_in_snapshot_shell '
+    export ANTHROPIC_BASE_URL=https://proxy.example
+    _CS_PROFILE=personal
+    claude go
+  ')"
+  assert_contains "warns about the base url" "$out" "ANTHROPIC_BASE_URL is set"
+  assert_contains "names the endpoint" "$out" "https://proxy.example"
+  teardown
+}
+
+t_snapshot_shell_wrapper_refuses_bad_profile() {
+  echo "[snapshot shell: wrapper still refuses an invalid _CS_PROFILE]"
+  setup
+  local out
+  out="$(run_in_snapshot_shell '_CS_PROFILE=../evil; claude go')"
+  assert_contains "refuses traversal profile" "$out" "refusing to launch"
+  assert_file_absent "fake claude NOT invoked" "$HOME/.claude-launch-env"
+  teardown
+}
+
+t_snapshot_shell_wrapper_unpinned_passthrough() {
+  echo "[snapshot shell: unpinned still passes through cleanly]"
+  setup
+  local out
+  out="$(run_in_snapshot_shell 'unset _CS_PROFILE; claude go')"
+  assert_not_contains "no command-not-found" "$out" "command not found"
+  assert_not_contains "no profile banner" "$out" "launching claude as"
+  assert_contains "args passed through" "$out" "FAKE_CLAUDE: go"
+  teardown
+}
+
+t_snapshot_shell_cs_self_heals() {
+  echo "[snapshot shell: cs dispatcher re-sources its helpers]"
+  setup
+  seed_profile personal personal@example.com
+  seed_profile work work@example.com
+  local out
+  out="$(run_in_snapshot_shell 'cs current; cs list')"
+  assert_not_contains "no command-not-found" "$out" "command not found"
+  assert_contains "lists personal" "$out" "personal"
+  assert_contains "lists work" "$out" "work"
+  teardown
+}
+
+t_snapshot_shell_provider_commands_self_heal() {
+  echo "[snapshot shell: provider subcommands work too]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  # Every provider function is a _cs_* name, so this whole feature was dead in a
+  # snapshot shell until cs learned to re-source itself.
+  local out
+  out="$(run_in_snapshot_shell 'cs login work gcloud')"
+  assert_not_contains "login: no command-not-found" "$out" "command not found"
+  assert_contains "login reaches the provider" "$out" "gcloud-profiles/work"
+  assert_file_exists "and writes the credential" \
+    "$HOME/.config/gcloud-profiles/work/application_default_credentials.json"
+  out="$(run_in_snapshot_shell 'cs doctor')"
+  assert_not_contains "doctor: no command-not-found" "$out" "command not found"
+  assert_contains "doctor reports the provider" "$out" "work — gcloud:"
+  teardown
+}
+
+t_snapshot_shell_reports_a_missing_self() {
+  echo "[snapshot shell: cs and claude say so when they cannot restore]"
+  setup
+  seed_profile personal personal@example.com
+  # _CS_SELF is how the recovery finds this file. Without it both entry points
+  # must give an actionable message, not a bare "command not found".
+  local out
+  for cmd in "cs list" "claude go"; do
+    out="$(zsh -c 'source "$1"
+      for __f in ${(k)functions}; do
+        [[ "$__f" == _[^_]* ]] && unfunction "$__f" 2>/dev/null
+      done
+      _CS_SELF=/nonexistent/cs.zsh
+      _CS_PROFILE=personal
+      eval "$2"' zsh "$CS_ZSH" "$cmd" 2>&1)"
+    assert_contains "$cmd explains the problem" "$out" "helper functions are missing"
+    assert_contains "$cmd says what to do" "$out" "Re-source cs.zsh and retry"
+    assert_not_contains "$cmd does not launch anyway" "$out" "FAKE_CLAUDE"
+  done
+  teardown
+}
+
+t_use_warn_list_stays_in_sync() {
+  echo "[use: the warn list matches _CS_AUTH_OVERRIDE_VARS]"
+  setup
+  # _cs_use names the overriding auth vars one per line rather than looping with
+  # ${(P)…} indirection, because that form is not parseable by the shfmt and
+  # shellcheck runs in CI. Two copies can drift, and a var missing here is one
+  # the user is never warned about. Pin them.
+  #
+  # CLAUDE_CODE_OAUTH_TOKEN is deliberately absent from the warn list: _cs_use
+  # UNSETS it a few lines earlier, with its own note, because it conflicts with
+  # the pin. Warning that it is "still set" would be false.
+  local canonical listed
+  canonical="$(print -l "${_CS_AUTH_OVERRIDE_VARS[@]}" |
+    grep -v '^CLAUDE_CODE_OAUTH_TOKEN$' | sort -u | tr '\n' ' ')"
+  listed="$(grep -oE 'present\+=\([A-Z][A-Z0-9_]+\)' "$CS_ZSH" |
+    grep -oE '[A-Z][A-Z0-9_]+' | sort -u | tr '\n' ' ')"
+  assert_eq "warn list == _CS_AUTH_OVERRIDE_VARS minus the token" "$listed" "$canonical"
+  teardown
+}
+
+t_restore_helper_survives_the_snapshot_filter() {
+  echo "[snapshot shell: the recovery helper is itself kept]"
+  setup
+  # The double underscore is what makes one recovery path possible instead of
+  # two inlined copies. If the filter ever drops __ names too, this fails first
+  # and explains why everything else broke.
+  local out
+  out="$(run_in_snapshot_shell 'typeset -f __cs_restore >/dev/null && print KEPT || print DROPPED')"
+  assert_contains "__cs_restore survives" "$out" "KEPT"
+  out="$(run_in_snapshot_shell 'typeset -f _cs_validate_name >/dev/null && print KEPT || print DROPPED')"
+  assert_contains "_cs_* helpers do not" "$out" "DROPPED"
+  teardown
+}
+
 #------------------------------------------------------------------- run
 
 # Install a fake `gcloud` that records its argv and answers `auth list` from a
@@ -1905,6 +2101,16 @@ t_credential_missing_is_reported
 t_login_abort_cleans_up
 t_rm_reports_exact_leftover_service
 t_installer
+t_snapshot_shell_wrapper_launches
+t_snapshot_shell_wrapper_scrubs_override_auth_vars
+t_snapshot_shell_wrapper_warns_about_base_url
+t_snapshot_shell_wrapper_refuses_bad_profile
+t_snapshot_shell_wrapper_unpinned_passthrough
+t_snapshot_shell_cs_self_heals
+t_snapshot_shell_provider_commands_self_heal
+t_snapshot_shell_reports_a_missing_self
+t_restore_helper_survives_the_snapshot_filter
+t_use_warn_list_stays_in_sync
 t_login_provider_grammar
 t_login_gcloud_provider
 t_login_gcloud_does_not_pin_the_shell
