@@ -135,7 +135,7 @@ cs current       # what is this shell pinned to?
 cs env work      # show the profile's env file for other tools
 cs doctor        # verify logins, catch duplicate accounts, check providers
 cs off           # unpin this shell
-cs rm work       # delete a profile's config + keychain login
+cs rm work       # delete a profile's config, keychain login, and tool credentials
 ```
 
 ## Pinning your other tools (`profile.env`)
@@ -360,6 +360,14 @@ Use `_cs_with_profile_env <profile> <command...>` inside a hook. It applies the 
 
 Inside a hook, call `_cs_profile_pins <VAR>` before you read `VAR`. It answers whether this profile exported the name, which is the test that keeps an inherited value out of your tool.
 
+A third hook is optional:
+
+```sh
+_cs_provider_<tool>_paths <profile>   # directories this tool owns, one per line
+```
+
+`cs rm` asks for those paths before it deletes anything, lists them in the confirmation prompt, and deletes them with the profile. Print paths; do not delete them yourself. `cs rm` holds the guards, and it refuses any path that is your home directory, a shared configuration directory, or the profiles root.
+
 ## The `claude` wrapper (and how to avoid it)
 
 Sourcing `cs.zsh` defines a `claude` shell function that keeps `CLAUDE_CONFIG_DIR` aligned with your pin and strips overriding auth vars before launching the real binary.
@@ -392,6 +400,7 @@ export CS_QUIET=1
 - 🩺 `cs doctor` flags the real failure mode: one account in multiple namespaces (which causes surprise re-logins).
 - 🖥️ CLI-only: desktop app and IDE extensions do not inherit your shell's `CLAUDE_CONFIG_DIR`.
 - 🔐 `~/.claude/profiles/<name>` contains full Claude Code login state. Protect it like your normal Claude config.
+- 🗑️ `cs rm <name>` also deletes the profile's gcloud directory, because `cs login <name> gcloud` puts a live OAuth token there. It names every such directory in the confirmation prompt first, and refuses to delete a shared one.
 - 📁 Profiles stay under `~/.claude/profiles` even though `cs` now pins more than Claude Code. Claude Code names each keychain entry after the hash of that path. Moving the directory would orphan every stored credential.
 - 🧰 `profile.env` pins other tools. `cs` sources it, so it runs code. Keep it to plain `export` lines, and keep it `chmod 600`.
 - 🧹 Upgrading from a pre-keychain version? Those releases stored plaintext credentials in `~/.claude/accounts/<name>.*` — including a dump with your claude.ai tokens **and** every MCP server's tokens and client secrets. `cs rm <name>` now deletes them; check that directory for profiles you no longer use.

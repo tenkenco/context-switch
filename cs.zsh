@@ -178,6 +178,19 @@ typeset -ga _CS_ENV_BLOCKED_VARS=(
 # did. Keep the file to plain exports and this stays predictable.
 typeset -ga _cs_env_var_names
 typeset -g _cs_env_parse_ambiguous=0
+
+# Record _cs_env_var_names into the exported tracking list.
+#
+# In a function, so the join runs under a known IFS. `${array[*]}` joins on the
+# FIRST character of IFS, `emulate -L zsh` does not reset IFS, and the readers
+# (_cs_clear_profile_env, _cs_profile_pins) split on whitespace. A caller whose
+# shell has `IFS=,` would otherwise record "CS_A,CS_B", and the next cleanup
+# would call `unset "CS_A,CS_B"`, fail on an invalid parameter name, and leave
+# both variables set — the cross-profile drift this feature exists to stop.
+_cs_export_env_var_names() {
+  local IFS=$' \t\n'
+  export _CS_PROFILE_ENV_VARS="${_cs_env_var_names[*]}"
+}
 _cs_parse_env_vars() {
   _cs_env_var_names=()
   _cs_env_parse_ambiguous=0
@@ -205,8 +218,31 @@ _cs_parse_env_vars() {
     fi
     _cs_env_var_names+=("$name")
   done < <(awk '
+    # Cut an unquoted trailing comment, using the shell rule: a "#" starts a
+    # comment only at the start of a word, and never inside quotes. Without this
+    # the tokenizer read comment text as exported names, so
+    #   export CS_FOO=bar # note B=2
+    # tracked a phantom "B" that `cs off` then unset out of the user'"'"'s shell, and
+    #   export CS_FOO=bar # legacy PATH=/x
+    # got the whole file refused for setting PATH, which it does not.
+    function strip_comment(s,   i, c, p, q, esc) {
+      q = ""
+      esc = 0
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (esc) { esc = 0; continue }
+        if (c == "\\") { esc = 1; continue }
+        if (q != "") { if (c == q) q = ""; continue }
+        if (c == "\"" || c == "'"'"'") { q = c; continue }
+        if (c == "#") {
+          p = (i == 1) ? " " : substr(s, i - 1, 1)
+          if (p ~ /[[:space:]]/) return substr(s, 1, i - 1)
+        }
+      }
+      return s
+    }
     /^[[:space:]]*export[[:space:]]/ {
-      line = $0
+      line = strip_comment($0)
       sub(/^[[:space:]]*export[[:space:]]+/, "", line)
       quoted = (line ~ /["'"'"']/)
       n = split(line, parts, /[[:space:]]+/)
@@ -358,7 +394,7 @@ _cs_load_profile_env() {
   # already applied. Tracking afterwards would skip the record and strand those
   # variables set-but-untracked forever, which is precisely the cross-profile
   # drift this feature exists to stop.
-  ((${#_cs_env_var_names})) && export _CS_PROFILE_ENV_VARS="${_cs_env_var_names[*]}"
+  ((${#_cs_env_var_names})) && _cs_export_env_var_names
 
   # Snapshot the shell essentials before sourcing. The blocked-name check reads
   # `export` lines, but a BARE assignment (`IFS=,`, `PATH=/nowhere`) never
@@ -402,7 +438,7 @@ _cs_load_profile_env() {
   # so a bare `unset _CS_PROFILE_ENV_VARS` (or a bare assignment) is invisible to
   # the parser and would silently disable every later cleanup.
   if ((${#_cs_env_var_names})); then
-    export _CS_PROFILE_ENV_VARS="${_cs_env_var_names[*]}"
+    _cs_export_env_var_names
   fi
 
   if ((src_rc != 0)); then
@@ -578,18 +614,42 @@ _cs_provider_list() { printf '%s' "${_CS_PROVIDERS[*]}"; }
 # the same reason it does there: running a gcloud login from a shell pinned to
 # `work` must not hand the child work's CLOUDSDK_CONFIG.
 #
-# Exits 2 when the profile.env could not be loaded. A provider hook must not
+# Returns 2 when the profile.env could not be loaded. A provider hook must not
 # turn a broken or refused env file into "your gcloud login is wrong": those are
 # different problems with different fixes, and _cs_load_profile_env has already
 # said which one it hit.
+#
+# A marker file decides that, not the subshell's exit status. An exit status
+# cannot say it, because the command being run owns the whole range: gcloud uses
+# argparse, so `cs login work gcloud --bogus-flag` exits 2 for a usage error,
+# and reporting that as a broken profile.env sent the user to a file that was
+# fine. The marker is written only after the load succeeds, so a 2 that reaches
+# the caller with the marker present is the command's own 2.
+# Set by _cs_with_profile_env: 1 when the profile.env loaded, 0 when it did not.
+# A caller reads this INSTEAD of the exit status, because the status belongs to
+# the command that ran.
+typeset -g _cs_env_load_ok=0
+
 _cs_with_profile_env() {
   local name="$1"
   shift
+  local marker rc
+  _cs_env_load_ok=0
+  marker="$(mktemp -t cs-env.XXXXXX 2>/dev/null)" || {
+    echo "cs: could not create a temporary file in ${TMPDIR:-/tmp}." >&2
+    return 1
+  }
   (
     _cs_clear_profile_env
     _cs_load_profile_env "$name" || exit 2
+    printf 'loaded' >"$marker"
     "$@"
   )
+  rc=$?
+  [[ -s "$marker" ]] && _cs_env_load_ok=1
+  rm -f "$marker"
+  ((_cs_env_load_ok)) || return 2
+  return "$rc"
 }
 
 # Did THIS profile's profile.env export $1?
@@ -742,6 +802,21 @@ _cs_gcloud_check_here() {
   return "$bad"
 }
 
+# Directories this provider owns for a profile, one per line, for `cs rm`.
+# Printing paths rather than deleting them keeps every delete — and every guard
+# on what must never be deleted — in _cs_rm, where the rest of them already are.
+_cs_gcloud_paths_here() {
+  _cs_profile_pins CLOUDSDK_CONFIG || return 0
+  [[ -n "${CLOUDSDK_CONFIG:-}" ]] || return 0
+  printf '%s\n' "$CLOUDSDK_CONFIG"
+}
+
+_cs_provider_gcloud_paths() {
+  local name="$1"
+  [[ -f "$(_cs_profile_env_file "$name")" ]] || return 0
+  _cs_with_profile_env "$name" _cs_gcloud_paths_here
+}
+
 _cs_provider_gcloud_check() {
   local name="$1"
   command -v gcloud >/dev/null 2>&1 || return 2
@@ -814,10 +889,10 @@ _cs_provider_gcloud_login() {
   }
   _cs_with_profile_env "$name" _cs_gcloud_login_here "$name" "$@"
   local rc=$?
-  # 2 means the profile.env itself could not be loaded, so no login ran.
-  # _cs_load_profile_env has already printed which rule the file broke; say what
-  # that means for this command, and do not report it as a gcloud failure.
-  ((rc == 2)) && {
+  # Read the flag, not the status. gcloud exits 2 on a usage error of its own,
+  # so `cs login work gcloud --bogus-flag` must pass that 2 through rather than
+  # send the user to a profile.env that is fine.
+  ((_cs_env_load_ok)) || {
     echo "cs: no gcloud login ran, because profile '$name' has an unusable" >&2
     echo "    profile.env. Fix the file, then run this again." >&2
     return 1
@@ -1109,6 +1184,35 @@ EOF
   return 0
 }
 
+# True when `cs rm` must NOT delete this path. A provider names its own
+# directories, and a profile.env is a file the user edits, so a typo here would
+# be catastrophic rather than annoying. Refuse anything that is not clearly a
+# per-profile directory, and say which path was skipped.
+#
+# gcloud's own ~/.config/gcloud is refused by name: deleting it would take every
+# login made in an unpinned shell, which is not this profile's to remove.
+_cs_rm_path_unsafe() {
+  local p="$1" why=""
+  local home="${HOME%/}"
+  if [[ -z "$p" || "$p" != /* ]]; then
+    why="not an absolute path"
+  elif [[ "$p" == *..* ]]; then
+    why="contains '..'"
+  elif [[ "$p" == "/" || "$p" == "$home" || "$p" == "$home/" ]]; then
+    why="is / or your home directory"
+  elif [[ "$home" == "$p"/* ]]; then
+    why="contains your home directory"
+  elif [[ "$p" == "$home/.config" || "$p" == "$home/.config/gcloud" ]]; then
+    why="is a shared configuration directory"
+  elif [[ "$p" == "$(_cs_profiles_root)" ]]; then
+    why="is the profiles root"
+  else
+    return 1
+  fi
+  echo "cs: refusing to delete $p — it $why." >&2
+  return 0
+}
+
 _cs_rm() {
   local name="${1:-}"
   [[ -z "$name" ]] && {
@@ -1131,7 +1235,29 @@ _cs_rm() {
     return 1
   fi
 
+  # Ask every provider what it owns for this profile, BEFORE anything is
+  # deleted: the answer comes from profile.env, and `rm -rf "$cfg_dir"` below
+  # takes that file with it. Without this, `cs login <name> gcloud` left a live
+  # OAuth refresh token in the gcloud directory and removed the only record of
+  # where that directory was.
+  local -a provider_paths=()
+  local prov ppath
+  for prov in "${_CS_PROVIDERS[@]}"; do
+    typeset -f "_cs_provider_${prov}_paths" >/dev/null 2>&1 || continue
+    while IFS= read -r ppath; do
+      [[ -n "$ppath" ]] || continue
+      _cs_rm_path_unsafe "$ppath" && continue
+      [[ -d "$ppath" ]] && provider_paths+=("$ppath")
+    done < <("_cs_provider_${prov}_paths" "$name" 2>/dev/null)
+  done
+
   local what="config + keychain login"
+  if ((${#provider_paths})); then
+    what="$what + provider credentials"
+    echo "cs: '$name' also has tool credentials outside the profile directory:" >&2
+    local f
+    for f in "${provider_paths[@]}"; do echo "      $f" >&2; done
+  fi
   if ((${#_cs_legacy_files})); then
     what="$what + legacy credential files"
     echo "cs: '$name' has legacy plaintext credential files from an older cs:" >&2
@@ -1187,6 +1313,19 @@ _cs_rm() {
   fi
 
   rm -rf "$cfg_dir"
+  if ((${#provider_paths})); then
+    # Same reporting rule as the legacy files below: these hold live
+    # credentials, so a silent failure is the worst outcome.
+    local pleft=()
+    for ppath in "${provider_paths[@]}"; do
+      rm -rf "$ppath"
+      [[ -e "$ppath" ]] && pleft+=("$ppath")
+    done
+    if ((${#pleft})); then
+      echo "cs: warning — could not delete: ${pleft[*]}" >&2
+      echo "    These hold live credentials; remove them by hand." >&2
+    fi
+  fi
   if ((${#_cs_legacy_files})); then
     # Report anything that survived rather than claiming a clean removal: these
     # are live credentials, so a silent failure is the worst outcome.
@@ -1350,8 +1489,10 @@ Usage:
                     logged into more than one namespace (the thing that causes
                     surprise re-logins). Also runs every provider's check.
   cs current        Print the pin for this shell.
-  cs rm <name>      Delete a profile's config, its keychain login, and any
-                    legacy plaintext credential files left by an older cs.
+  cs rm <name>      Delete a profile's config, its keychain login, any legacy
+                    plaintext credential files left by an older cs, and the
+                    directories its providers own (such as the profile's gcloud
+                    directory). Names them all before it deletes anything.
 
 One-time setup (per account):
   cs login personal
@@ -1417,8 +1558,9 @@ Providers:
   into that global directory is the leak this feature exists to prevent.
 
   Providers are plain functions, found by name. To add your own, define
-  _cs_provider_<tool>_login (and optionally _cs_provider_<tool>_check) in your
-  .zshrc, then append the name to _CS_PROVIDERS so `cs doctor` calls it.
+  _cs_provider_<tool>_login (and optionally _cs_provider_<tool>_check, and
+  _cs_provider_<tool>_paths for `cs rm`) in your .zshrc, then append the name to
+  _CS_PROVIDERS so `cs doctor` and `cs rm` call it.
 
 The golden rule:
   One account -> one profile, and always `cs use` before `claude`. Claude Code

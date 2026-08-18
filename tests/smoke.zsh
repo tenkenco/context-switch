@@ -158,7 +158,8 @@ SH
     _cs_load_profile_env _cs_env _cs_env_find_blocked _cs_env_path_unsafe \
     _cs_source_diagnostics _cs_login _cs_login_cleanup _cs_use _cs_run _cs_off \
     _cs_list _cs_current _cs_rm _cs_doctor _cs_help \
-    _cs_validate_provider _cs_provider_list _cs_with_profile_env _cs_profile_pins \
+    _cs_validate_provider _cs_provider_list _cs_with_profile_env _cs_profile_pins _cs_export_env_var_names _cs_rm_path_unsafe \
+    _cs_provider_gcloud_paths _cs_gcloud_paths_here \
     _cs_provider_claude_login _cs_provider_gcloud_login _cs_provider_gcloud_check \
     _cs_gcloud_login_here _cs_gcloud_check_here _cs_gcloud_project 2>/dev/null
   _CS_KC_SCHEME_CACHE=""
@@ -1397,6 +1398,117 @@ t_login_gcloud_does_not_pin_the_shell() {
   teardown
 }
 
+t_env_parser_ignores_comments() {
+  echo "[profile.env: an unquoted comment is not a variable name]"
+  setup
+  seed_profile work
+  # A phantom name in a comment must not be tracked, and must not be unset.
+  seed_profile_env work 'export CS_TEST_ONE=one # note CS_TEST_TWO=2'
+  export CS_TEST_TWO="mine"
+  cs use work >/dev/null 2>&1
+  assert_eq "comment name not tracked" "$_CS_PROFILE_ENV_VARS" "CS_TEST_ONE"
+  cs off >/dev/null 2>&1
+  assert_eq "the shell's own variable survives" "${CS_TEST_TWO-gone}" "mine"
+  unset CS_TEST_TWO
+
+  # A blocked name inside a comment must not get the file refused.
+  seed_profile_env work 'export CS_TEST_ONE=one # legacy PATH=/nowhere'
+  local out
+  out="$(cs use work 2>&1)"
+  assert_not_contains "no false refusal" "$out" "refusing to load"
+  assert_contains "the real export applies" "$out" "profile.env applied — CS_TEST_ONE"
+  cs off >/dev/null 2>&1
+
+  # A '#' inside a quoted value is part of the value, not a comment.
+  seed_profile_env work 'export CS_TEST_ONE="a#b"'
+  cs use work >/dev/null 2>&1
+  assert_eq "quoted hash kept" "$CS_TEST_ONE" "a#b"
+  cs off >/dev/null 2>&1
+
+  # A real second export on the same line is still tracked.
+  seed_profile_env work 'export CS_TEST_ONE=one CS_TEST_TWO=two # trailing'
+  cs use work >/dev/null 2>&1
+  assert_eq "both real names tracked" "$_CS_PROFILE_ENV_VARS" "CS_TEST_ONE CS_TEST_TWO"
+  cs off >/dev/null 2>&1
+  teardown
+}
+
+t_env_tracking_survives_a_custom_ifs() {
+  echo "[profile.env: tracking does not depend on the caller's IFS]"
+  setup
+  seed_profile work
+  seed_profile_env work 'export CS_TEST_ONE=one
+export CS_TEST_TWO=two'
+  local saved="$IFS"
+  IFS=,
+  cs use work >/dev/null 2>&1
+  assert_eq "names joined on whitespace" "$_CS_PROFILE_ENV_VARS" "CS_TEST_ONE CS_TEST_TWO"
+  cs off >/dev/null 2>&1
+  assert_eq "first name unset" "${CS_TEST_ONE-gone}" "gone"
+  assert_eq "second name unset" "${CS_TEST_TWO-gone}" "gone"
+  IFS="$saved"
+  teardown
+}
+
+t_gcloud_usage_error_is_not_a_broken_env_file() {
+  echo "[gcloud: the tool's own exit 2 is not a profile.env failure]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  # gcloud uses argparse, which exits 2 on a usage error.
+  cat >"$SANDBOX/bin/gcloud" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >>"${HOME}/.gcloud-argv"
+exit 2
+SH
+  chmod +x "$SANDBOX/bin/gcloud"
+  local out
+  out="$(cs login work gcloud --bogus-flag 2>&1)"
+  assert_not_contains "does not blame profile.env" "$out" "unusable"
+  assert_contains "the login was attempted" "$(cat "$HOME/.gcloud-argv")" "--bogus-flag"
+  cs login work gcloud --bogus-flag >/dev/null 2>&1
+  assert_eq "gcloud's own status is passed through" "$?" "2"
+  teardown
+}
+
+t_rm_removes_provider_credentials() {
+  echo "[rm: deletes the profile's gcloud directory too]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  cs login work gcloud >/dev/null 2>&1
+  local gdir="$HOME/.config/gcloud-profiles/work"
+  assert_file_exists "the login wrote credentials" "$gdir/application_default_credentials.json"
+
+  local out
+  out="$(printf 'y\n' | cs rm work 2>&1)"
+  assert_contains "names the directory before deleting" "$out" "$gdir"
+  assert_contains "the prompt mentions provider credentials" "$out" "provider credentials"
+  assert_dir_absent "the gcloud directory is gone" "$gdir"
+  assert_dir_absent "the profile is gone" "$HOME/.claude/profiles/work"
+  teardown
+}
+
+t_rm_refuses_a_shared_directory() {
+  echo "[rm: never deletes a shared gcloud directory]"
+  setup
+  fake_gcloud
+  seed_profile work work@corp.com
+  # A profile.env that points at gcloud's own shared directory.
+  seed_profile_env work "export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud\""
+  mkdir -p "$HOME/.config/gcloud"
+  printf '{}\n' >"$HOME/.config/gcloud/credentials.db"
+  local out
+  out="$(printf 'y\n' | cs rm work 2>&1)"
+  assert_contains "says it refused" "$out" "refusing to delete"
+  assert_contains "explains why" "$out" "shared configuration directory"
+  assert_file_exists "the shared directory survives" "$HOME/.config/gcloud/credentials.db"
+  assert_dir_absent "the profile is still removed" "$HOME/.claude/profiles/work"
+  teardown
+}
+
 t_gcloud_ignores_inherited_config() {
   echo "[gcloud: a CLOUDSDK_CONFIG from the user's shell is never used]"
   setup
@@ -1608,6 +1720,11 @@ t_login_gcloud_provider
 t_login_gcloud_does_not_pin_the_shell
 t_doctor_gcloud_checks
 t_gcloud_ignores_inherited_config
+t_env_parser_ignores_comments
+t_env_tracking_survives_a_custom_ifs
+t_gcloud_usage_error_is_not_a_broken_env_file
+t_rm_removes_provider_credentials
+t_rm_refuses_a_shared_directory
 t_gcloud_ignores_inherited_adc_path
 t_gcloud_adc_outside_the_config_dir
 t_gcloud_unusable_env_file

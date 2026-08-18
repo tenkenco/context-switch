@@ -216,6 +216,34 @@ inside the subshell it names this profile's exports and nothing else.
 
 The rule reads as one sentence: being set is not the same as being pinned.
 
+### Why a load failure is a flag, not an exit status
+
+`_cs_with_profile_env` must tell its caller two different things: what the
+command returned, and whether the `profile.env` loaded at all. One exit status
+cannot carry both, because the command owns the whole range. gcloud uses
+argparse, which exits 2 on a usage error, so `cs login work gcloud
+--bogus-flag` returned 2 and cs blamed a `profile.env` that was fine.
+
+The subshell writes a marker file after the load succeeds. The parent reads the
+marker into `_cs_env_load_ok` and passes the command's own status through
+untouched. A caller reads the flag; the status stays the tool's.
+
+### Why `cs rm` asks providers for paths
+
+`cs login <name> gcloud` writes an OAuth refresh token into the profile's
+`CLOUDSDK_CONFIG` directory, which sits outside the profile directory. Deleting
+the profile alone left that token on disk, and took `profile.env` — the only
+record of where the directory was — with it. The same function already deletes
+legacy plaintext credentials for exactly this reason.
+
+A provider prints the directories it owns; `cs rm` deletes them. The split is
+deliberate. Providers are the extension point, including hooks a user writes,
+and a path comes from a file the user edits. Keeping every delete in `cs rm`
+keeps the guards in one place: it refuses a path that is not absolute, that
+contains `..`, that is the home directory or an ancestor of it, that is a shared
+configuration directory such as `~/.config/gcloud`, or that is the profiles
+root. It names every path in the confirmation prompt before anything is deleted.
+
 ### Why check hooks have three results
 
 A provider check returns 0 for healthy, 1 for a real problem, and 2 for no
