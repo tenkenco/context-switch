@@ -1462,7 +1462,7 @@ t_version() {
 
   # An unknown subcommand must still be refused, so `version` did not widen the
   # dispatcher by accident.
-  out="$(cs versionn 2>&1)"
+  out="$(cs nope 2>&1)"
   assert_contains "unknown subcommand still refused" "$out" "unknown subcommand"
   teardown
 }
