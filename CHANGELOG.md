@@ -2,6 +2,14 @@
 
 This project follows [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `cs use` and `cs current` name the gcloud account and project this shell
+  holds. Both read the configuration files under `CLOUDSDK_CONFIG` directly,
+  because calling `gcloud` costs seconds on every pin.
+
 ## 1.0.0 — 2026-08-18
 
 First tagged release. The project was called `claude-switch` before this.

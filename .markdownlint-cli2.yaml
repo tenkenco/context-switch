@@ -1,2 +1,7 @@
 config:
   MD013: false
+  # A changelog repeats Added / Changed / Fixed under every version, which is
+  # the Keep a Changelog format, not a mistake. Only flag duplicates that sit
+  # under the same parent heading.
+  MD024:
+    siblings_only: true

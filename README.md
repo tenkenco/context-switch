@@ -133,7 +133,7 @@ claude
 
 cs run work -- -p "hi"   # one-shot: run claude as work without pinning
 cs list          # show profiles, * marks this shell's pin
-cs current       # what is this shell pinned to?
+cs current       # what is this shell pinned to? (names the gcloud account too)
 cs env work      # show the profile's env file for other tools
 cs doctor        # verify logins, catch duplicate accounts, check providers
 cs version       # which release you are on
@@ -212,6 +212,19 @@ Run this check after you log in. It must print a real file:
 cs use work
 ls -l "$GOOGLE_APPLICATION_CREDENTIALS"
 ```
+
+#### `cs` names the gcloud account it pinned
+
+`cs use` and `cs current` print the gcloud account and project this shell holds:
+
+```text
+cs: this shell pinned to 'work' (you@work.com). Run 'claude' to launch.
+cs: gcloud — you@work.com (my-project)
+```
+
+Both read the configuration files under `CLOUDSDK_CONFIG` directly. Neither runs `gcloud`, which would add seconds to every `cs use`.
+
+A profile that pins no gcloud directory prints nothing.
 
 #### Check which accounts a profile holds
 
