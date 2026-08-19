@@ -1137,6 +1137,12 @@ _cs_use() {
     echo "cs: this shell pinned to '$name' (not logged in yet — run: cs login $name)."
   fi
 
+  # Name the gcloud identity this shell just took on, for the same reason the
+  # Claude account is named above: a silent switch is the failure this tool
+  # exists to prevent.
+  local gid
+  gid="$(_cs_gcloud_identity)" && echo "cs: gcloud — $gid"
+
   # The pin above always succeeds, but a refused or failing profile.env must not
   # be swallowed: `cs use work && terraform apply` would otherwise run against
   # whichever cloud identity the shell already carried.
@@ -1231,9 +1237,52 @@ _cs_list() {
   ((found)) || echo "(no profiles — run: cs login <name>)"
 }
 
+# The gcloud account and project this shell is pinned to, or nothing.
+#
+# Reads the configuration files directly rather than calling gcloud. Two
+# `gcloud config get-value` calls cost 8 seconds against a cold directory and
+# 2 seconds warm; this runs on every `cs use`, and the files answer the same
+# question in milliseconds.
+#
+# Layout: CLOUDSDK_CONFIG/active_config names the configuration, and
+# CLOUDSDK_CONFIG/configurations/config_<name> is an INI file whose [core]
+# section holds the account and the project.
+_cs_gcloud_identity() {
+  [[ -n "${CLOUDSDK_CONFIG:-}" ]] || return 1
+  local active="default"
+  [[ -r "$CLOUDSDK_CONFIG/active_config" ]] && active="$(<"$CLOUDSDK_CONFIG/active_config")"
+  # cs does not write active_config, so treat its contents as data: the value
+  # becomes part of a path on the next line.
+  [[ "$active" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  local f="$CLOUDSDK_CONFIG/configurations/config_$active"
+  [[ -r "$f" ]] || return 1
+
+  local line account project
+  line="$(awk -F= '
+    /^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
+    sec == "[core]" && index($0, "=") > 0 {
+      k = $1; gsub(/[[:space:]]/, "", k)
+      v = substr($0, index($0, "=") + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      if (k == "account") a = v
+      if (k == "project") p = v
+    }
+    END { print a "\t" p }
+  ' "$f" 2>/dev/null)"
+  account="${line%%$'\t'*}"
+  project="${line#*$'\t'}"
+  [[ -n "$account" ]] || return 1
+  printf '%s (%s)' "$account" "${project:-no project set}"
+}
+
 _cs_current() {
+  local gid
   if [[ -n "${_CS_PROFILE:-}" ]]; then
     echo "$_CS_PROFILE"
+    # The gcloud identity is the other thing this shell is pinned to, and
+    # getting it wrong reads as a permissions error rather than a wrong-account
+    # error. Name it here so the answer is one command, not three.
+    gid="$(_cs_gcloud_identity)" && echo "  gcloud: $gid"
     return 0
   fi
   if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then

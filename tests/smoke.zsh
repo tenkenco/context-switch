@@ -149,7 +149,8 @@ SH
 
   unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE _CS_PROFILE_ENV_VARS \
     ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
-    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO CS_TEST_GCLOUD_LOGIN_FAIL 2>/dev/null
+    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO CS_TEST_GCLOUD_LOGIN_FAIL \
+    CLOUDSDK_CONFIG GOOGLE_APPLICATION_CREDENTIALS 2>/dev/null
   unfunction cs claude _cs_prev_claude _cs_validate_name _cs_profiles_root \
     _cs_profile_config_dir _cs_sha256_8 _cs_keychain_service _cs_profile_email \
     _cs_profile_is_set_up _cs_profile_has_credential _cs_keychain_scheme_intact \
@@ -157,7 +158,7 @@ SH
     _cs_profile_env_file _cs_parse_env_vars _cs_clear_profile_env \
     _cs_load_profile_env _cs_env _cs_env_find_blocked _cs_env_path_unsafe \
     _cs_source_diagnostics _cs_login _cs_login_cleanup _cs_use _cs_run _cs_off \
-    _cs_list _cs_current _cs_rm _cs_doctor _cs_help __cs_restore \
+    _cs_list _cs_current _cs_rm _cs_doctor _cs_help __cs_restore _cs_gcloud_identity \
     _cs_validate_provider _cs_provider_list _cs_with_profile_env _cs_profile_pins _cs_export_env_var_names _cs_rm_path_unsafe \
     _cs_provider_gcloud_paths _cs_gcloud_paths_here \
     _cs_provider_claude_login _cs_provider_gcloud_login _cs_provider_gcloud_check \
@@ -166,11 +167,16 @@ SH
   source "$CS_ZSH" 2>/dev/null
 }
 
+# Note CLOUDSDK_CONFIG and GOOGLE_APPLICATION_CREDENTIALS below. A test that
+# pins a gcloud-carrying profile in THIS shell leaks them into every later test,
+# whose `cs doctor` then runs the REAL gcloud against a deleted sandbox path —
+# seconds per call, and a result that depends on the machine.
 teardown() {
   [[ -n "${SANDBOX:-}" && -d "$SANDBOX" ]] && rm -rf "$SANDBOX"
   unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR _CS_PROFILE _CS_PROFILE_ENV_VARS SANDBOX \
     ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
-    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO CS_TEST_GCLOUD_LOGIN_FAIL 2>/dev/null
+    CS_TEST_TOOL CS_TEST_ONE CS_TEST_TWO CS_TEST_GCLOUD_LOGIN_FAIL \
+    CLOUDSDK_CONFIG GOOGLE_APPLICATION_CREDENTIALS 2>/dev/null
   PATH="${PATH#*:}"
 }
 
@@ -1438,6 +1444,125 @@ t_snapshot_shell_reports_a_missing_self() {
   teardown
 }
 
+# Write a gcloud configuration for a profile, the way gcloud lays it out.
+seed_gcloud_config() {
+  local name="$1" account="$2" project="${3:-}" active="${4:-default}"
+  local root="$HOME/.config/gcloud-profiles/$name"
+  mkdir -p "$root/configurations"
+  printf '%s\n' "$active" >"$root/active_config"
+  {
+    printf '[core]\n'
+    printf 'account = %s\n' "$account"
+    [[ -n "$project" ]] && printf 'project = %s\n' "$project"
+  } >"$root/configurations/config_$active"
+}
+
+t_gcloud_identity_reporting() {
+  echo "[identity: cs names the gcloud account this shell holds]"
+  setup
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  seed_gcloud_config work you@corp.com my-project
+
+  # `cs use` must run in THIS shell, not a command-substitution subshell, or the
+  # pin never reaches the `cs current` below.
+  local out
+  cs use work >|"$SANDBOX/.out" 2>&1
+  out="$(<"$SANDBOX/.out")"
+  assert_contains "cs use names the account" "$out" "gcloud — you@corp.com"
+  assert_contains "cs use names the project" "$out" "(my-project)"
+  out="$(cs current 2>&1)"
+  assert_contains "cs current names it too" "$out" "gcloud: you@corp.com (my-project)"
+  assert_contains "and still names the profile" "$out" "work"
+
+  # A configuration with no project set must say so, not print "()".
+  seed_gcloud_config work you@corp.com ""
+  out="$(cs current 2>&1)"
+  assert_contains "no project is named" "$out" "(no project set)"
+
+  # A non-default active configuration is followed.
+  seed_gcloud_config work other@corp.com other-project staging
+  out="$(cs current 2>&1)"
+  assert_contains "follows active_config" "$out" "other@corp.com (other-project)"
+
+  # Whitespace around '=' is gcloud's own format; tolerate variations.
+  mkdir -p "$HOME/.config/gcloud-profiles/work/configurations"
+  printf 'default\n' >"$HOME/.config/gcloud-profiles/work/active_config"
+  printf '[core]\naccount=tight@corp.com\nproject   =   padded-project\n' \
+    >"$HOME/.config/gcloud-profiles/work/configurations/config_default"
+  out="$(cs current 2>&1)"
+  assert_contains "tolerates spacing" "$out" "tight@corp.com (padded-project)"
+
+  # A key outside [core] must not be read as the account.
+  printf '[compute]\naccount = wrong@corp.com\n[core]\naccount = right@corp.com\n' \
+    >"$HOME/.config/gcloud-profiles/work/configurations/config_default"
+  out="$(cs current 2>&1)"
+  assert_contains "only reads [core]" "$out" "right@corp.com"
+  assert_not_contains "ignores other sections" "$out" "wrong@corp.com"
+  cs off >/dev/null 2>&1
+  teardown
+}
+
+t_gcloud_identity_stays_quiet() {
+  echo "[identity: nothing to say means nothing is said]"
+  setup
+  seed_profile plain plain@corp.com
+  local out
+
+  # A profile that pins no gcloud directory.
+  cs use plain >|"$SANDBOX/.out" 2>&1
+  out="$(<"$SANDBOX/.out")"
+  assert_not_contains "silent with no CLOUDSDK_CONFIG" "$out" "gcloud"
+  out="$(cs current 2>&1)"
+  assert_not_contains "cs current silent too" "$out" "gcloud"
+  cs off >/dev/null 2>&1
+
+  # Pinned, but gcloud was never logged in there, so no config file exists.
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  cs use work >|"$SANDBOX/.out" 2>&1
+  out="$(<"$SANDBOX/.out")"
+  assert_not_contains "silent with no config file" "$out" "gcloud —"
+  cs off >/dev/null 2>&1
+
+  # A config file with no account is not an identity.
+  mkdir -p "$HOME/.config/gcloud-profiles/work/configurations"
+  printf 'default\n' >"$HOME/.config/gcloud-profiles/work/active_config"
+  printf '[core]\nproject = orphan\n' \
+    >"$HOME/.config/gcloud-profiles/work/configurations/config_default"
+  cs use work >|"$SANDBOX/.out" 2>&1
+  out="$(<"$SANDBOX/.out")"
+  assert_not_contains "silent with no account" "$out" "gcloud —"
+  cs off >/dev/null 2>&1
+
+  # active_config is a file cs does not write. A traversal in it must not make
+  # cs read some other file.
+  printf '../../../../etc/passwd\n' >"$HOME/.config/gcloud-profiles/work/active_config"
+  cs use work >|"$SANDBOX/.out" 2>&1
+  out="$(<"$SANDBOX/.out")"
+  assert_not_contains "refuses a traversal in active_config" "$out" "gcloud —"
+  assert_not_contains "reads nothing from it" "$out" "root:"
+  cs off >/dev/null 2>&1
+  teardown
+}
+
+t_gcloud_identity_needs_no_gcloud_binary() {
+  echo "[identity: reported without running gcloud]"
+  setup
+  seed_profile work work@corp.com
+  seed_gcloud_env work
+  seed_gcloud_config work you@corp.com my-project
+  # No fake gcloud is installed in this test, and PATH has none. Reporting the
+  # identity must still work: it reads files. This also pins the performance
+  # decision — two `gcloud config get-value` calls cost seconds on every pin.
+  local out
+  cs use work >/dev/null 2>&1
+  out="$(cs current 2>&1)"
+  assert_contains "still reports the account" "$out" "you@corp.com (my-project)"
+  cs off >/dev/null 2>&1
+  teardown
+}
+
 t_version() {
   echo "[version: cs reports its own version]"
   setup
@@ -2141,6 +2266,9 @@ t_snapshot_shell_reports_a_missing_self
 t_restore_helper_survives_the_snapshot_filter
 t_use_warn_list_stays_in_sync
 t_version
+t_gcloud_identity_reporting
+t_gcloud_identity_stays_quiet
+t_gcloud_identity_needs_no_gcloud_binary
 t_login_provider_grammar
 t_login_gcloud_provider
 t_login_gcloud_does_not_pin_the_shell
